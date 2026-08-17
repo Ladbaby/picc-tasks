@@ -1,0 +1,15 @@
+{
+  "name": "@ladbabynpm/picc-tasks",
+  "version": "0.1.0",
+  "description": "Claude Code-style task tools for pi: TaskCreate/TaskGet/TaskList/TaskUpdate with dependency edges, /tasks command, and status widget.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi", "pi-package", "pi-extension", "tasks", "todo", "tracking"],
+  "files": ["index.ts", "README.md"],
+  "pi": { "extensions": ["./index.ts"] },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "publishConfig": { "access": "public" }
+}
