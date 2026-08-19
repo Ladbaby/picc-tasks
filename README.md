@@ -2,7 +2,7 @@
 
 [![npm downloads](https://img.shields.io/npm/dt/@ladbabynpm/picc-tasks.svg)](https://www.npmjs.com/package/@ladbabynpm/picc-tasks)
 
-Claude Code style task tools for pi.
+Claude Code style task tools for pi, a more faithful port of Claude Code's harness than [@tintinweb/pi-tasks](https://pi.dev/packages/@tintinweb/pi-tasks?name=pi-tasks).
 Part of [picc](https://github.com/Ladbaby/picc), a pi agent setup mirroring Claude Code's harness.
 Adds Claude Code's TodoV2 task-tracking toolset — `TaskCreate`, `TaskGet`, `TaskList`, and `TaskUpdate` — with dependency edges, an above-editor status widget, a footer status pill, a `/tasks` command, and a recurring "task tools haven't been used" reminder.
 Behavior, schemas, output text, storage layout, and post-task nudges all mirror Claude Code's task tools (`tools/TaskCreateTool`, `tools/TaskGetTool`, `tools/TaskListTool`, `tools/TaskUpdateTool`) — see the in-line source citations for which Claude Code function each section was ported from.
