@@ -860,7 +860,7 @@ Set up task dependencies:
 		promptGuidelines: [],
 		parameters: Type.Object({
 			activeForm: Type.Optional(
-                Type.Array(Type.String(), {
+                Type.String({
                     description: "Present continuous form shown in spinner when in_progress (e.g., \"Running tests\")",
                 }),
             ),
@@ -875,7 +875,7 @@ Set up task dependencies:
 				}),
 			),
 			description: Type.Optional(
-                Type.Array(Type.String(), {
+                Type.String({
                     description: "New description for the task",
                 }),
             ),
@@ -885,13 +885,15 @@ Set up task dependencies:
 				}),
 			),
 			owner: Type.Optional(
-                Type.Array(Type.String(), {
+                Type.String({
                     description: "New owner for the task",
                 }),
             ),
-			status: Type.Optional(STATUS_SCHEMA),
+			status: Type.Optional(STATUS_SCHEMA, {
+				description: "New status for the task",
+			}),
 			subject: Type.Optional(
-                Type.Array(Type.String(), {
+                Type.String({
                     description: "New subject for the task",
                 }),
             ),
