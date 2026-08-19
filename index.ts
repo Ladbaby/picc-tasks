@@ -122,18 +122,6 @@ let taskListId: string | null = null;
 let lastCtx: ExtensionContext | null = null;
 
 // ---------------------------------------------------------------------------
-// State-machine validation
-// ---------------------------------------------------------------------------
-
-function isValidStatusTransition(from: TaskStatus, to: TaskStatus): boolean {
-	if (to === "deleted") return true;
-	if (from === "pending" && to === "in_progress") return true;
-	if (from === "in_progress" && to === "completed") return true;
-	if (from === "completed" && to === "in_progress") return true; // re-open
-	return false;
-}
-
-// ---------------------------------------------------------------------------
 // taskListId resolution — matches Claude Code's `getTaskListId()` semantics.
 // Priority:
 //   1. PI_TASKS_TASK_LIST_ID env var (pi-specific, highest priority)
@@ -732,7 +720,7 @@ function registerTaskUpdate(pi: ExtensionAPI): void {
 		promptGuidelines: [
 			"Use TaskUpdate to transition task status: pending → in_progress → completed, or → deleted.",
 			"Use addBlockedBy to record that this task depends on other tasks; use addBlocks to record that this task blocks them.",
-			"Status state machine: pending → in_progress → completed. Setting status: deleted removes the task AND cleans up its ID from every other task's blocks/blockedBy arrays.",
+			"Status typically progresses pending → in_progress → completed (any transition is accepted). Setting status: deleted removes the task AND cleans up its ID from every other task's blocks/blockedBy arrays.",
 			"metadata is merged shallowly; set a key to null to delete that key (Claude Code semantics).",
 		],
 		parameters: Type.Object({
@@ -762,11 +750,11 @@ function registerTaskUpdate(pi: ExtensionAPI): void {
 			const idx = tasks.findIndex((t) => t.id === params.taskId);
 			if (idx === -1) {
 				return {
-					content: [{ type: "text", text: `Task #${params.taskId} not found` }],
+					content: [{ type: "text", text: "Task not found" }],
 					details: {
 						success: false,
 						taskId: params.taskId,
-						error: "not_found",
+						error: "Task not found",
 						updatedFields: [],
 					},
 				};
@@ -774,49 +762,11 @@ function registerTaskUpdate(pi: ExtensionAPI): void {
 
 			const task = tasks[idx]!;
 			const updatedFields: string[] = [];
-			let statusChange: { from: TaskStatus; to: TaskStatus } | undefined;
+			let statusChange: { from: TaskStatus; to: TaskStatus | "deleted" } | undefined;
 
-			// --- Status change (special-cased: "deleted" removes the task) ---
-			if (params.status !== undefined && params.status !== task.status) {
-				if (params.status === "deleted") {
-					const fromStatus = task.status;
-					const id = task.id;
-					deleteTask(id);
-					commitChange(pi, _ctx);
-					markTaskToolUsed();
-					return {
-						content: [{ type: "text", text: `Task #${id} deleted.` }],
-						details: {
-							success: true,
-							taskId: id,
-							updatedFields: ["status"],
-							statusChange: { from: fromStatus, to: "deleted" },
-						},
-					};
-				}
-
-				if (!isValidStatusTransition(task.status, params.status)) {
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Invalid status transition: ${task.status} → ${params.status}. Allowed: pending → in_progress → completed (or completed → in_progress to re-open), and any → deleted.`,
-							},
-						],
-						details: {
-							success: false,
-							taskId: task.id,
-							error: "invalid_transition",
-							updatedFields: [],
-						},
-					};
-				}
-				statusChange = { from: task.status, to: params.status };
-				task.status = params.status;
-				updatedFields.push("status");
-			}
-
-			// --- Field updates (only if changed) ---
+			// --- Field updates (only if changed). Pushed in Claude Code's
+			//     order: subject, description, activeForm, owner, metadata, status,
+			//     blocks, blockedBy. ---
 			if (params.subject !== undefined && params.subject !== task.subject) {
 				task.subject = params.subject;
 				updatedFields.push("subject");
@@ -832,6 +782,50 @@ function registerTaskUpdate(pi: ExtensionAPI): void {
 			if (params.owner !== undefined && params.owner !== task.owner) {
 				task.owner = params.owner;
 				updatedFields.push("owner");
+			}
+
+			// --- Metadata merge (Claude Code pushes "metadata" whenever it is
+			//     provided; null deletes a key; an empty result clears metadata) ---
+			if (params.metadata !== undefined) {
+				const merged: Record<string, unknown> = { ...(task.metadata ?? {}) };
+				for (const [k, v] of Object.entries(params.metadata)) {
+					if (v === null) {
+						delete merged[k];
+					} else {
+						merged[k] = v;
+					}
+				}
+				if (Object.keys(merged).length > 0) {
+					task.metadata = merged;
+				} else {
+					task.metadata = undefined;
+				}
+				updatedFields.push("metadata");
+			}
+
+			// --- Status (any transition allowed; "deleted" removes the task) ---
+			if (params.status !== undefined && params.status !== task.status) {
+				if (params.status === "deleted") {
+					statusChange = { from: task.status, to: "deleted" };
+					const id = task.id;
+					deleteTask(id);
+					commitChange(pi, _ctx);
+					markTaskToolUsed();
+					// Claude Code's deletion path reports a clean `['deleted']`
+					// (it does not carry over other fields from this call).
+					return {
+						content: [{ type: "text", text: `Updated task #${id} deleted` }],
+						details: {
+							success: true,
+							taskId: id,
+							updatedFields: ["deleted"],
+							statusChange,
+						},
+					};
+				}
+				statusChange = { from: task.status, to: params.status };
+				task.status = params.status;
+				updatedFields.push("status");
 			}
 
 			// --- Dependency edges (append-only with dedupe + mirror inverse) ---
@@ -862,52 +856,11 @@ function registerTaskUpdate(pi: ExtensionAPI): void {
 				if (task.blockedBy.length > before) updatedFields.push("blockedBy");
 			}
 
-			// --- Metadata merge (null deletes a key; empty result clears metadata) ---
-			if (params.metadata) {
-				const merged: Record<string, unknown> = { ...(task.metadata ?? {}) };
-				let changed = false;
-				for (const [k, v] of Object.entries(params.metadata)) {
-					if (v === null) {
-						if (k in merged) {
-							delete merged[k];
-							changed = true;
-						}
-					} else {
-						if (merged[k] !== v) {
-							merged[k] = v;
-							changed = true;
-						}
-					}
-				}
-				if (Object.keys(merged).length > 0) {
-					task.metadata = merged;
-				} else {
-					if (task.metadata !== undefined) {
-						task.metadata = undefined;
-						changed = true;
-					}
-				}
-				if (changed) updatedFields.push("metadata");
-			}
-
-			if (updatedFields.length === 0 && !statusChange) {
-				markTaskToolUsed();
-				// Match Claude Code's `TaskUpdateTool` wording exactly for the
-				// no-op case: "Updated task #1 " (trailing space, empty
-				// join). Some small LLMs loop on a "unchanged." message trying
-				// to fix a phantom mistake; the Claude Code phrasing gives them
-				// no signal to act on, so the agent loop stays on the real task.
-				return {
-					content: [{ type: "text", text: `Updated task #${task.id} ` }],
-					details: { success: true, taskId: task.id, updatedFields: [] },
-				};
-			}
-
 			// --- Verification nudge check (mirrors Claude Code's TaskUpdateTool) ---
-			// The `allDone` check inside the helper filters down to the exact
-			// moment Claude Code fires: the last task's completion in a 3+
-			// task list with no `/verif/i` subject. The nudge is appended to
-			// the tool result text, not sent as a separate follow-up.
+			// NOTE: Claude Code additionally gates the nudge on `updates.status === 'completed'`
+			// (it fires only when *this* call completed a task). We fire whenever all tasks
+			// are done; this is moot because the nudge is off by default (see ENV_VERIFICATION_NUDGE).
+			// The nudge is appended to the tool result text, not sent as a separate follow-up.
 			const verificationNudgeNeeded = computeVerificationNudgeNeeded();
 			markTaskToolUsed();
 
@@ -923,7 +876,10 @@ function registerTaskUpdate(pi: ExtensionAPI): void {
 				details.verificationNudgeNeeded = true;
 			}
 
-			let resultText = `Updated task #${task.id} (${updatedFields.join(", ") || "no fields"}).`;
+			// Claude Code format: `Updated task #<id> <updatedFields.join(", ")>`
+			// (bare, no parens/period). An empty join yields a trailing space —
+			// the intentional no-op phrasing that keeps small models from looping.
+			let resultText = `Updated task #${task.id} ${updatedFields.join(", ")}`;
 			if (verificationNudgeNeeded) {
 				resultText += VERIFICATION_NUDGE_TEXT;
 			}
