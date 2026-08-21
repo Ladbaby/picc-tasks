@@ -86,17 +86,17 @@ One line per visible task:
 
 | Env var | Default | Effect |
 |---------|---------|--------|
-| `PI_TASKS_TASK_LIST_ID` | (unset) | Explicit task-list id. Highest priority in task-list resolution. |
-| `CLAUDE_CODE_TASK_LIST_ID` | (unset) | Claude Code parity override. Used when `PI_TASKS_TASK_LIST_ID` is unset. |
+| `PI_TASK_LIST_ID` | (unset) | Explicit task-list id. Highest priority in task-list resolution. |
+| `CLAUDE_CODE_TASK_LIST_ID` | (unset) | Claude Code parity override. Used when `PI_TASK_LIST_ID` is unset. |
 | `PI_TASKS_VERIFICATION_NUDGE` | (unset) | When set to `1`/`true`/`yes`/`on`, enables the "spawn the verification agent" nudge. Off by default — mirrors Claude Code's default where the nudge is gated behind a build feature flag and a GrowthBook experiment, both off for end users. |
 
-Task-list id resolution mirrors Claude Code's `getTaskListId()`: `PI_TASKS_TASK_LIST_ID` → `CLAUDE_CODE_TASK_LIST_ID` → the session ID (per-session isolation by default).
+Task-list id resolution mirrors Claude Code's `getTaskListId()`: `PI_TASK_LIST_ID` → `CLAUDE_CODE_TASK_LIST_ID` → the session ID (per-session isolation by default).
 
 ## Storage (Claude Code parity)
 
 Task state is dual-persisted so a `/reload`, `/new`, `/fork`, or `/resume` never loses it:
 
-1. **Session branch** — every mutating tool call appends a custom `pi-tasks-state` entry containing the full snapshot (`tasks` + `highWaterMark`). On `session_start`/`session_tree` the latest snapshot in the branch is replayed via `ctx.sessionManager.getBranch()`.
+1. **Session branch** — every mutating tool call appends a custom `picc-tasks-state` entry containing the full snapshot (`tasks` + `highWaterMark`). On `session_start`/`session_tree` the latest snapshot in the branch is replayed via `ctx.sessionManager.getBranch()`.
 2. **Disk fallback** — the same snapshot is atomically written (temp + rename) to `~/.pi/tasks/{taskListId}/tasks.json`. On replay a three-way merge picks the source of truth using `highWaterMark` as a monotonic version counter: if disk is newer than the branch (e.g. `appendEntry` failed on a stale ctx), disk wins; otherwise the branch wins.
 
 The branch snapshot wins by default because it is inherently session-scoped via the JSONL, so unrelated sessions in the same cwd no longer see each other's tasks.
