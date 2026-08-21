@@ -1,6 +1,6 @@
 {
 	"name": "@ladbabynpm/picc-tasks",
-	"version": "0.1.1",
+	"version": "0.1.2",
 	"description": "Claude Code style TaskCreate, TaskGet, TaskList, and TaskUpdate tools for pi, a more faithful port of Claude Code's harness than @tintinweb/pi-tasks.",
 	"type": "module",
 	"license": "MIT",
