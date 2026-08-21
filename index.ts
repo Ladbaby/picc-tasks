@@ -354,7 +354,15 @@ const VERIFICATION_NUDGE_TEXT =
 // it is owned by picc-bash, not this extension.
 // ---------------------------------------------------------------------------
 
-let currentTurnIndex = 0;
+// We keep our OWN monotonic turn counter rather than trusting the runtime's
+// `TurnStartEvent.turnIndex`. The runtime resets `turnIndex` to 0 at the start
+// of every agent *run* (`agent_start` fires once per user prompt, and each
+// user prompt is its own run), so a normal conversation of short runs never
+// lets `turnIndex` climb past TURNS_SINCE_WRITE — the reminder would only fire
+// on unusually long single runs. Counting ourselves (increment per turn_start,
+// reset only on session shutdown) makes "N turns since last task tool" survive
+// across runs, matching Claude Code's session-level cadence.
+let currentTurnIndex = -1;
 let lastTaskToolTurnIndex = -1; // -1 = never called this session
 let lastReminderTurnIndex = -1;
 
@@ -1105,8 +1113,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// task_reminder cadence — see TODO_REMINDER_CONFIG above.
-	pi.on("turn_start", async (event) => {
-		currentTurnIndex = event.turnIndex;
+	// Increment our OWN monotonic counter each turn. We deliberately ignore
+	// `event.turnIndex` (see the note above `currentTurnIndex`): the runtime
+	// resets it to 0 every agent run, which would break the across-runs cadence.
+	pi.on("turn_start", async () => {
+		currentTurnIndex += 1;
 		maybeFireTaskReminder(pi);
 	});
 
@@ -1120,7 +1131,7 @@ export default function (pi: ExtensionAPI) {
 		taskListId = null;
 		lastCtx = null;
 		// Turn counters reset on shutdown so a new session starts fresh.
-		currentTurnIndex = 0;
+		currentTurnIndex = -1;
 		lastTaskToolTurnIndex = -1;
 		lastReminderTurnIndex = -1;
 	});
