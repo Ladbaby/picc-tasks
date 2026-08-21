@@ -362,6 +362,18 @@ const VERIFICATION_NUDGE_TEXT =
 // on unusually long single runs. Counting ourselves (increment per turn_start,
 // reset only on session shutdown) makes "N turns since last task tool" survive
 // across runs, matching Claude Code's session-level cadence.
+//
+// The reminder DECISION is made in `turn_end` (not `turn_start`), and only when
+// the turn that just finished actually ran tools. That mirrors Claude Code's
+// `needsFollowUp` gate (query.ts:1062): the reminder is evaluated in the
+// "between turns" path, which only runs when the prior turn had `tool_use`
+// blocks. A final turn with no tool calls (e.g. the agent answered and is
+// waiting on the user) must not trigger it, otherwise a spurious steer forces
+// an extra turn at the end of the conversation.
+//
+// Note: the reminder is intentionally NOT gated on permission mode. Claude
+// Code's `getTaskReminderAttachments` / `getTodoReminderAttachments` have no
+// `permissionContext.mode` check, so the nag fires in plan/auto/etc. too.
 let currentTurnIndex = -1;
 let lastTaskToolTurnIndex = -1; // -1 = never called this session
 let lastReminderTurnIndex = -1;
@@ -1118,7 +1130,20 @@ export default function (pi: ExtensionAPI) {
 	// resets it to 0 every agent run, which would break the across-runs cadence.
 	pi.on("turn_start", async () => {
 		currentTurnIndex += 1;
-		maybeFireTaskReminder(pi);
+	});
+
+	// Decide whether to fire the reminder at the END of each turn, and only
+	// when that turn executed at least one tool. `event.toolResults` is empty
+	// for an answer-only final turn, so a conversation that ends with the agent
+	// producing a plain reply (e.g. "Want me to commit these?") no longer
+	// triggers the reminder. A steer sent here is delivered before the next LLM
+	// call — the same "between turns" injection point Claude Code uses — and a
+	// tool turn is always followed by a next LLM call in pi's loop, so the
+	// queued steer is always consumed.
+	pi.on("turn_end", async (event) => {
+		if (event.toolResults.length > 0) {
+			maybeFireTaskReminder(pi);
+		}
 	});
 
 	pi.on("session_shutdown", () => {
