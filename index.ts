@@ -1,5 +1,5 @@
 /**
- * pi-tasks — TaskCreate / TaskGet / TaskList / TaskUpdate
+ * picc-tasks — TaskCreate / TaskGet / TaskList / TaskUpdate
  *
  * Single-file extension replicating Claude Code's TodoV2 task tools
  * (tools/TaskCreateTool, TaskGetTool, TaskListTool, TaskUpdateTool) on top of
@@ -12,10 +12,10 @@
  * Storage (aligned with Claude Code's `getTaskListId` model in
  * claude-code/utils/tasks.ts):
  *   - In-memory `tasks: Task[]` + `highWaterMark` (closure-captured).
- *   - taskListId = PI_TASKS_TASK_LIST_ID ?? CLAUDE_CODE_TASK_LIST_ID ??
+ *   - taskListId = PI_TASK_LIST_ID ?? CLAUDE_CODE_TASK_LIST_ID ??
  *     sessionManager.getSessionId(); default is per-session isolation.
  *   - On every mutating tool call, append a custom session entry
- *     `pi-tasks-state` containing the full snapshot — replayed on
+ *     `picc-tasks-state` containing the full snapshot — replayed on
  *     `session_start` and `session_tree` via `ctx.sessionManager.getBranch()`.
  *     The branch snapshot wins; it is inherently session-scoped via the JSONL.
  *   - Mirrored to `~/.pi/tasks/{taskListId}/tasks.json` (atomic temp+rename)
@@ -56,12 +56,12 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 // Constants
 // ---------------------------------------------------------------------------
 
-const TASK_STATE_ENTRY = "pi-tasks-state";
-const WIDGET_KEY = "pi-tasks";
+const TASK_STATE_ENTRY = "picc-tasks-state";
+const WIDGET_KEY = "picc-tasks";
 const TASKS_FILE_NAME = "tasks.json";
 
 /** Env-var overrides for the task list ID (matches Claude Code's `getTaskListId`). */
-const ENV_TASK_LIST_ID_PI = "PI_TASKS_TASK_LIST_ID";
+const ENV_TASK_LIST_ID_PI = "PI_TASK_LIST_ID";
 const ENV_TASK_LIST_ID_CC = "CLAUDE_CODE_TASK_LIST_ID";
 
 /**
@@ -124,7 +124,7 @@ let lastCtx: ExtensionContext | null = null;
 // ---------------------------------------------------------------------------
 // taskListId resolution — matches Claude Code's `getTaskListId()` semantics.
 // Priority:
-//   1. PI_TASKS_TASK_LIST_ID env var (pi-specific, highest priority)
+//   1. PI_TASK_LIST_ID env var (pi-specific, highest priority)
 //   2. CLAUDE_CODE_TASK_LIST_ID env var (Claude Code parity)
 //   3. sessionManager.getSessionId() (default: per-session isolation)
 // ---------------------------------------------------------------------------
@@ -178,7 +178,7 @@ function loadFromDisk(): PersistedFile {
 			highWaterMark: Number(parsed.highWaterMark) || 0,
 		};
 	} catch (err) {
-		console.error(`[pi-tasks] failed to load ${stateFile}, starting empty:`, err);
+		console.error(`[picc-tasks] failed to load ${stateFile}, starting empty:`, err);
 		return { tasks: [], highWaterMark: 0 };
 	}
 }
@@ -191,7 +191,7 @@ function persist(): void {
 			highWaterMark,
 		});
 	} catch (err) {
-		console.error("[pi-tasks] persist failed:", err);
+		console.error("[picc-tasks] persist failed:", err);
 	}
 }
 
@@ -234,7 +234,7 @@ function syncState(ctx: ExtensionContext): void {
 	} catch (err) {
 		// Defensive: getBranch() may throw during reload before the session
 		// manager is fully initialized. Fall through to disk-only load.
-		console.error("[pi-tasks] sessionManager.getBranch() failed, falling back to disk:", err);
+		console.error("[picc-tasks] sessionManager.getBranch() failed, falling back to disk:", err);
 		fromBranch = { tasks: [], highWaterMark: 0 };
 	}
 
@@ -284,10 +284,10 @@ function commitChange(pi: ExtensionAPI, ctx?: ExtensionContext): void {
 		const msg = err instanceof Error ? err.message : String(err);
 		if (msg.includes("stale after session replacement")) {
 			console.warn(
-				"[pi-tasks] appendEntry skipped: extension ctx stale; relying on disk snapshot.",
+				"[picc-tasks] appendEntry skipped: extension ctx stale; relying on disk snapshot.",
 			);
 		} else {
-			console.error("[pi-tasks] appendEntry failed:", err);
+			console.error("[picc-tasks] appendEntry failed:", err);
 		}
 	}
 	persist();
@@ -403,7 +403,7 @@ function sendTaskReminder(pi: ExtensionAPI, turnIndex: number): void {
 	const text = buildTaskReminderText();
 	try {
 		pi.sendMessage(
-			{ customType: "pi-tasks-reminder", content: text, display: false },
+			{ customType: "picc-tasks-reminder", content: text, display: false },
 			{ deliverAs: "steer", triggerTurn: false },
 		);
 		lastReminderTurnIndex = turnIndex;
@@ -416,7 +416,7 @@ function sendTaskReminder(pi: ExtensionAPI, turnIndex: number): void {
 			// the runner stays stale until the next session_start.
 			lastReminderTurnIndex = turnIndex;
 		} else {
-			console.error("[pi-tasks] task_reminder delivery failed:", err);
+			console.error("[picc-tasks] task_reminder delivery failed:", err);
 		}
 	}
 }
@@ -502,7 +502,7 @@ function refreshUI(ctx?: ExtensionContext): void {
 			uiHost.ui.setWidget(WIDGET_KEY, [header, ...lines], { placement: "aboveEditor" });
 		}
 	} catch (err) {
-		console.warn("[pi-tasks] refreshUI: setWidget failed:", err);
+		console.warn("[picc-tasks] refreshUI: setWidget failed:", err);
 	}
 
 	// Footer status pill
@@ -519,7 +519,7 @@ function refreshUI(ctx?: ExtensionContext): void {
 			);
 		}
 	} catch (err) {
-		console.warn("[pi-tasks] refreshUI: setStatus failed:", err);
+		console.warn("[picc-tasks] refreshUI: setStatus failed:", err);
 	}
 }
 
@@ -1094,7 +1094,7 @@ function registerTasksCommand(pi: ExtensionAPI): void {
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
 				if (!msg.includes("stale after session replacement")) {
-					console.error("[pi-tasks] /tasks command failed:", err);
+					console.error("[picc-tasks] /tasks command failed:", err);
 				}
 			}
 		},
