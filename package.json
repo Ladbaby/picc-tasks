@@ -1,41 +1,41 @@
 {
-	"name": "@ladbabynpm/picc-tasks",
-	"version": "0.1.2",
-	"description": "Claude Code style TaskCreate, TaskGet, TaskList, and TaskUpdate tools for pi, a more faithful port of Claude Code's harness than @tintinweb/pi-tasks.",
-	"type": "module",
-	"license": "MIT",
-	"author": "ladbabynpm",
-	"repository": {
-		"type": "git",
-		"url": "https://github.com/Ladbaby/picc-tasks.git"
-	},
-	"homepage": "https://github.com/Ladbaby/picc-tasks",
-	"bugs": {
-		"url": "https://github.com/Ladbaby/picc-tasks/issues"
-	},
-	"keywords": [
-		"pi",
-		"pi-package",
-		"pi-extension",
-		"tasks",
-		"todo",
-		"tracking"
-	],
-	"files": [
-		"index.ts",
-		"README.md",
-		"LICENSE"
-	],
-	"pi": {
-		"extensions": [
-			"./index.ts"
-		]
-	},
-	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": "*",
-		"typebox": "*"
-	},
-	"publishConfig": {
-		"access": "public"
-	}
+  "name": "@ladbabynpm/picc-tasks",
+  "version": "0.1.3",
+  "description": "Claude Code style TaskCreate, TaskGet, TaskList, and TaskUpdate tools for pi, a more faithful port of Claude Code's harness than @tintinweb/pi-tasks.",
+  "type": "module",
+  "license": "MIT",
+  "author": "ladbabynpm",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Ladbaby/picc-tasks.git"
+  },
+  "homepage": "https://github.com/Ladbaby/picc-tasks",
+  "bugs": {
+    "url": "https://github.com/Ladbaby/picc-tasks/issues"
+  },
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "tasks",
+    "todo",
+    "tracking"
+  ],
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
 }
