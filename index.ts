@@ -83,6 +83,12 @@ const TODO_REMINDER_CONFIG = {
 	TURNS_BETWEEN_REMINDERS: 10,
 } as const;
 
+/**
+ * Delay before the task list auto-hides and clears once every visible task is
+ * completed. Mirrors Claude Code's `HIDE_DELAY_MS` (hooks/useTasksV2.ts:23).
+ */
+const HIDE_DELAY_MS = 5000;
+
 const STATUSES = ["pending", "in_progress", "completed"] as const;
 type TaskStatus = (typeof STATUSES)[number];
 
@@ -120,6 +126,8 @@ let highWaterMark = 0;
 let stateFile: string | null = null;
 let taskListId: string | null = null;
 let lastCtx: ExtensionContext | null = null;
+/** Pending auto-hide timer, armed when every visible task is complete. */
+let hideTimer: ReturnType<typeof setTimeout> | null = null;
 
 // ---------------------------------------------------------------------------
 // taskListId resolution — matches Claude Code's `getTaskListId()` semantics.
@@ -295,6 +303,71 @@ function commitChange(pi: ExtensionAPI, ctx?: ExtensionContext): void {
 	// construction). Fall back to the module-level lastCtx when no ctx was
 	// supplied — syncState() does this right after setting lastCtx.
 	refreshUI(ctx);
+	// Re-evaluate auto-hide after every mutation (create/update/delete), the
+	// same point where Claude Code's useTasksV2 #fetch re-arms/clears its timer.
+	armHideTimer(pi);
+}
+
+// ---------------------------------------------------------------------------
+// Auto-hide + clear — mirrors Claude Code's useTasksV2 hide/clear pipeline
+// (hooks/useTasksV2.ts:137-169) and resetTaskList (utils/tasks.ts:175-217).
+// Once every visible task is completed, the list hides and clears from disk
+// after HIDE_DELAY_MS; any new/incomplete task cancels the pending clear.
+// ---------------------------------------------------------------------------
+
+function clearHideTimer(): void {
+	if (hideTimer !== null) {
+		clearTimeout(hideTimer);
+		hideTimer = null;
+	}
+}
+
+/**
+ * Wipe all tasks (Claude Code unlinks every task file on reset). highWaterMark
+ * is intentionally left monotonic so a fresh TaskCreate never reuses a cleared
+ * id — the same role as Claude Code's persisted `.highwatermark`.
+ */
+function resetTaskList(pi: ExtensionAPI): void {
+	clearHideTimer();
+	tasks = [];
+	try {
+		pi.appendEntry<TaskStateEntryData>(TASK_STATE_ENTRY, {
+			tasks: [],
+			highWaterMark,
+		});
+	} catch (err) {
+		// Same stale-ctx swallow as commitChange: a session replacement after the
+		// last mutation means the branch is gone, but disk still reflects the clear.
+		const msg = err instanceof Error ? err.message : String(err);
+		if (!msg.includes("stale after session replacement")) {
+			console.error("[picc-tasks] resetTaskList appendEntry failed:", err);
+		}
+	}
+	persist();
+	refreshUI(); // lastCtx best-effort; refreshUI already swallows stale ctx
+}
+
+function armHideTimer(pi: ExtensionAPI): void {
+	clearHideTimer();
+	const visible = tasks.filter(isVisible);
+	const hasIncomplete = visible.some((t) => t.status !== "completed");
+	if (hasIncomplete || visible.length === 0) {
+		// Incomplete work in flight, or nothing to show — no auto-hide.
+		return;
+	}
+	// All visible tasks are complete: hide + clear after a grace period.
+	hideTimer = setTimeout(() => {
+		hideTimer = null;
+		// Re-check (mirrors #onHideTimerFired): only clear if still all-complete.
+		// A new TaskCreate/TaskUpdate since arming already cleared the timer via
+		// armHideTimer, but guard anyway against races.
+		const cur = tasks.filter(isVisible);
+		if (cur.length > 0 && cur.every((t) => t.status === "completed")) {
+			resetTaskList(pi);
+		}
+	}, HIDE_DELAY_MS);
+	// Don't hold the event loop open in a headless run (mirrors CC .unref()).
+	(hideTimer as unknown as { unref?: () => void }).unref?.();
 }
 
 // ---------------------------------------------------------------------------
