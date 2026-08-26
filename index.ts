@@ -50,7 +50,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { Type } from "typebox";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -97,6 +97,53 @@ const TASK_ICONS: Record<TaskStatus, string> = {
 	in_progress: "▪",
 	completed: "✓",
 };
+
+/**
+ * pi caps an above/below-editor widget at a fixed number of rendered lines
+ * (`InteractiveMode.MAX_WIDGET_LINES = 10`), appending its own
+ * `... (widget truncated)` line when the array is longer. We budget the widget
+ * to stay under that cap so the "truncated" marker never appears: one line is
+ * reserved for the count header, leaving TASK_LINES_BUDGET lines for task rows
+ * (a collapsed `… +N completed` footer, when present, fits within that budget).
+ */
+const WIDGET_MAX_LINES = 10;
+const TASK_LINES_BUDGET = WIDGET_MAX_LINES - 1;
+
+/**
+ * Status → marker glyph for the styled widget, mirroring Claude Code's
+ * TaskListV2 `getTaskIcon` (figures: squareSmall `▫` / squareSmallFilled `▪` /
+ * tick `✓`). `▉` was a tall vertical block that read as a bright bar rather
+ * than a marker; the small filled square matches Claude Code's in-progress
+ * glyph. Distinct from TASK_ICONS, which the plain-text `renderTaskListLine`
+ * (used by the `/tasks` command) still uses.
+ */
+const WIDGET_ICONS: Record<TaskStatus, string> = {
+	pending: "☐",
+	in_progress: "▪",
+	completed: "✓",
+};
+
+// ---------------------------------------------------------------------------
+// Local truncation helper
+//
+// `@earendil-works/pi-coding-agent` does not re-export pi-tui's
+// `truncateToWidth`, and we must not add a direct pi-tui dependency (only
+// `node:*`, `typebox`, and pi-coding-agent are allowed). This small helper is
+// good enough for the short subjects pi users write; theme styling is applied
+// only after truncation, so it never sees ANSI.
+// ---------------------------------------------------------------------------
+
+/**
+ * Code-point truncate to `maxWidth`, appending a single `…`. Subjects are
+ * plain (no ANSI) here, so visible-width == code-point count; the only ANSI in
+ * the widget comes from the theme styling applied *after* this truncation.
+ */
+function truncateSubject(subject: string, maxWidth: number): string {
+	if (maxWidth <= 1) return "…";
+	const chars = Array.from(subject);
+	if (chars.length <= maxWidth) return subject;
+	return chars.slice(0, Math.max(0, maxWidth - 1)).join("") + "…";
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -528,6 +575,40 @@ function renderTaskListLine(t: Task): string {
 	return line;
 }
 
+/**
+ * Styled, Claude Code TaskListV2-style line for the above-editor widget.
+ *
+ * Per-status styling (mirrors TaskListV2's `getTaskIcon` + row flags):
+ *   - completed   → green ✓, subject struck-through + dim
+ *   - in_progress → accent-colored ▪ (the Claude Code `claude` brand color), subject bold
+ *   - pending     → dim ☐, subject plain (dim when blocked)
+ * A task with unresolved blockers appends a dim ` › blocked by #…` suffix.
+ * Only this widget path emits ANSI; the LLM-facing and `/tasks` outputs stay
+ * plain (see `renderTaskListLine` / `renderTaskListLineForLLM`).
+ */
+function renderWidgetTaskLine(
+	theme: Theme,
+	t: Task,
+	unresolved: Set<string>,
+	maxSubject: number,
+): string {
+	const icon = WIDGET_ICONS[t.status];
+	const live = t.blockedBy.filter((id) => unresolved.has(id));
+	const blocked = live.length > 0;
+	const blockedSuffix = blocked
+		? theme.fg("dim", ` › blocked by ${live.map((id) => `#${id}`).join(", ")}`)
+		: "";
+	const subject = truncateSubject(t.subject, maxSubject);
+	switch (t.status) {
+		case "completed":
+			return `${theme.fg("success", icon)} ${theme.fg("muted", theme.strikethrough(subject))}`;
+		case "in_progress":
+			return `${theme.fg("accent", icon)} ${theme.bold(subject)}${blockedSuffix}`;
+		default: // pending
+			return `${theme.fg("dim", icon)} ${theme.fg(blocked ? "dim" : "text", subject)}${blockedSuffix}`;
+	}
+}
+
 // refreshUI() is best-effort: any ctx-stale error must be swallowed so it
 // never propagates out of a tool's execute() as an is_error result. The
 // in-memory `tasks` array is what matters for correctness; the widget
@@ -560,19 +641,61 @@ function refreshUI(ctx?: ExtensionContext): void {
 
 	const visible = tasks.filter(isVisible);
 
-	// Above-editor widget
+	// Above-editor widget (Claude Code TaskListV2 look).
 	try {
 		if (visible.length === 0) {
 			uiHost.ui.setWidget(WIDGET_KEY, undefined as unknown as string);
 		} else {
+			const theme = uiHost.ui.theme;
 			const counts = {
 				pending: visible.filter((t) => t.status === "pending").length,
 				in_progress: visible.filter((t) => t.status === "in_progress").length,
 				completed: visible.filter((t) => t.status === "completed").length,
 			};
 			const header = `Tasks  ${counts.pending} pending · ${counts.in_progress} in progress · ${counts.completed} done`;
-			const lines = visible.map(renderTaskListLine);
-			uiHost.ui.setWidget(WIDGET_KEY, [header, ...lines], { placement: "aboveEditor" });
+
+			// Reserve a bit of line width for the icon, a space, and a possible
+			// ` › blocked by` suffix so truncated subjects still fit.
+			const maxSubject = 72;
+			const unresolved = new Set(
+				tasks.filter((x) => x.status !== "completed").map((x) => x.id),
+			);
+			const byIdAsc = (a: Task, b: Task) =>
+				Number(a.id) - Number(b.id) || a.id.localeCompare(b.id);
+
+			const inProgress = visible.filter((t) => t.status === "in_progress").sort(byIdAsc);
+			const pending = visible.filter((t) => t.status === "pending").sort(byIdAsc);
+			const completed = visible.filter((t) => t.status === "completed").sort(byIdAsc);
+
+			// Put live work on top, completed (struck-through) below. When the
+			// list would overflow the widget, keep every in_progress + pending
+			// line and only the most recent completed tasks, folding the older
+			// completed ones into a single `… +N completed` footer — this is what
+			// makes completed tasks "roll off" and keeps the view following
+			// progress (pi has no separate widget scroll primitive).
+			const alwaysShown = [...inProgress, ...pending];
+			const remaining = Math.max(0, TASK_LINES_BUDGET - alwaysShown.length);
+			const collapse = completed.length > remaining;
+			// The footer takes one line, so the completed rows we show shrink by one.
+			const completedShownCount = collapse ? Math.max(0, remaining - 1) : remaining;
+			// Most-recent completed first (id-descending).
+			const completedShown = [...completed].reverse().slice(0, completedShownCount);
+			const hiddenCompleted = completed.length - completedShown.length;
+
+			const taskLines: string[] = [
+				...alwaysShown,
+				...completedShown,
+			].map((t) => renderWidgetTaskLine(theme, t, unresolved, maxSubject));
+
+			if (collapse) {
+				taskLines.push(theme.fg("dim", `… +${hiddenCompleted} completed`));
+			}
+
+			uiHost.ui.setWidget(
+				WIDGET_KEY,
+				[theme.fg("dim", header), ...taskLines],
+				{ placement: "aboveEditor" },
+			);
 		}
 	} catch (err) {
 		console.warn("[picc-tasks] refreshUI: setWidget failed:", err);
