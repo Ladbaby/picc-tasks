@@ -130,6 +130,13 @@ const WIDGET_ICONS: Record<TaskStatus, string> = {
  * reference appearance regardless of the active theme.
  */
 const COMPLETED_CHECK_GREEN = "\x1b[38;2;44;122;61m";
+/**
+ * Claude Code's in-progress bullet is the fixed brand "clay" `#9b563f`. pi's
+ * theme `accent` can resolve to olive/other tones depending on the active
+ * theme, so emit the exact brand color to keep in-progress rows distinct from
+ * completed and pending.
+ */
+const IN_PROGRESS_BRAND = "\x1b[38;2;155;86;63m";
 const ANSI_RESET = "\x1b[0m";
 
 // ---------------------------------------------------------------------------
@@ -361,7 +368,9 @@ function commitChange(pi: ExtensionAPI, ctx?: ExtensionContext): void {
 	refreshUI(ctx);
 	// Re-evaluate auto-hide after every mutation (create/update/delete), the
 	// same point where Claude Code's useTasksV2 #fetch re-arms/clears its timer.
-	armHideTimer(pi);
+	// Pass the caller's fresh ctx so the timer's later resetTaskList can still
+	// reach a live UI host (lastCtx may be stale by then).
+	armHideTimer(pi, ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +392,7 @@ function clearHideTimer(): void {
  * is intentionally left monotonic so a fresh TaskCreate never reuses a cleared
  * id — the same role as Claude Code's persisted `.highwatermark`.
  */
-function resetTaskList(pi: ExtensionAPI): void {
+function resetTaskList(pi: ExtensionAPI, ctx?: ExtensionContext): void {
 	clearHideTimer();
 	tasks = [];
 	try {
@@ -400,10 +409,20 @@ function resetTaskList(pi: ExtensionAPI): void {
 		}
 	}
 	persist();
-	refreshUI(); // lastCtx best-effort; refreshUI already swallows stale ctx
+	// Use the ctx that armed the timer (freshest available) so the widget
+	// actually clears; lastCtx can be stale by the time the timer fires.
+	refreshUI(ctx);
 }
 
-function armHideTimer(pi: ExtensionAPI): void {
+/**
+ * Re-evaluate auto-hide after every mutation. If every visible task is
+ * completed, arm a one-shot timer that hides the widget + clears disk after
+ * HIDE_DELAY_MS. Any new/incomplete task cancels the pending clear.
+ *
+ * The `ctx` (the tool's fresh per-call ctx) is captured so the timer can still
+ * reach a live UI host when it fires; by then `lastCtx` may be stale.
+ */
+function armHideTimer(pi: ExtensionAPI, ctx?: ExtensionContext): void {
 	clearHideTimer();
 	const visible = tasks.filter(isVisible);
 	const hasIncomplete = visible.some((t) => t.status !== "completed");
@@ -419,7 +438,7 @@ function armHideTimer(pi: ExtensionAPI): void {
 		// armHideTimer, but guard anyway against races.
 		const cur = tasks.filter(isVisible);
 		if (cur.length > 0 && cur.every((t) => t.status === "completed")) {
-			resetTaskList(pi);
+			resetTaskList(pi, ctx);
 		}
 	}, HIDE_DELAY_MS);
 	// Don't hold the event loop open in a headless run (mirrors CC .unref()).
@@ -589,7 +608,7 @@ function renderTaskListLine(t: Task): string {
  *
  * Per-status styling (mirrors TaskListV2's `getTaskIcon` + row flags):
  *   - completed   → green ✓ (`#2c7a3d`), subject struck-through + dim
- *   - in_progress → accent-colored ▪ (the Claude Code `claude` brand color), subject bold
+ *   - in_progress → brand-colored ▪ (the Claude Code `claude` clay `#9b563f`), subject bold
  *   - pending     → dim ▫, subject plain (dim when blocked)
  * A task with unresolved blockers appends a dim ` › blocked by #…` suffix.
  * Only this widget path emits ANSI; the LLM-facing and `/tasks` outputs stay
@@ -612,7 +631,7 @@ function renderWidgetTaskLine(
 		case "completed":
 			return `${COMPLETED_CHECK_GREEN}${icon}${ANSI_RESET} ${theme.fg("muted", theme.strikethrough(subject))}`;
 		case "in_progress":
-			return `${theme.fg("accent", icon)} ${theme.bold(subject)}${blockedSuffix}`;
+			return `${IN_PROGRESS_BRAND}${icon}${ANSI_RESET} ${theme.bold(subject)}${blockedSuffix}`;
 		default: // pending
 			return `${theme.fg("dim", icon)} ${theme.fg(blocked ? "dim" : "text", subject)}${blockedSuffix}`;
 	}
