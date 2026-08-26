@@ -101,10 +101,14 @@ const TASK_ICONS: Record<TaskStatus, string> = {
 /**
  * pi caps an above/below-editor widget at a fixed number of rendered lines
  * (`InteractiveMode.MAX_WIDGET_LINES = 10`), appending its own
- * `... (widget truncated)` line when the array is longer. We budget the widget
- * to stay under that cap so the "truncated" marker never appears: one line is
- * reserved for the count header, leaving TASK_LINES_BUDGET lines for task rows
- * (a collapsed `… +N completed` footer, when present, fits within that budget).
+ * `... (widget truncated)` line when the array is longer. One line is reserved
+ * for the count header, leaving TASK_LINES_BUDGET lines for task rows (a
+ * collapsed `… +…` footer, when present, fits within that budget).
+ *
+ * The *actual* row count shown is `min(getMaxDisplay(), TASK_LINES_BUDGET)`:
+ * `getMaxDisplay()` is terminal-height-derived exactly like Claude Code's
+ * `maxDisplay`, and TASK_LINES_BUDGET is the hard ceiling that keeps us under
+ * pi's 10-line widget cap so the "truncated" marker never appears.
  */
 const WIDGET_MAX_LINES = 10;
 const TASK_LINES_BUDGET = WIDGET_MAX_LINES - 1;
@@ -191,6 +195,55 @@ let taskListId: string | null = null;
 let lastCtx: ExtensionContext | null = null;
 /** Pending auto-hide timer, armed when every visible task is complete. */
 let hideTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * How long a just-completed task stays pinned near the top of the widget.
+ * Mirrors Claude Code's `RECENT_COMPLETED_TTL_MS` (TaskListV2.tsx:21). A task
+ * completed within this window is rendered above in-progress/pending work so a
+ * freshly-finished task is still visible for a moment before it rolls off.
+ */
+const RECENT_COMPLETED_TTL_MS = 30_000;
+
+/**
+ * id -> epoch-ms when the task transitioned to `completed`. Drives the
+ * RECENT_COMPLETED_TTL_MS recency window. Populated on the `→ completed`
+ * transition in TaskUpdate and pruned on deletion / leaving completed.
+ * (Claude Code derives the same by diffing the completed set each render; we
+ * capture it at the transition point so no per-render scan is needed.)
+ */
+const completionTimes: Map<string, number> = new Map();
+
+/**
+ * One-shot re-render timer armed by refreshUI() to drop a recently-completed
+ * task out of the truncated view the moment its TTL expires — without waiting
+ * for the next mutation. Mirrors Claude Code's `useEffect` that schedules
+ * `forceUpdate` to the earliest expiry (TaskListV2.tsx:68-85).
+ */
+let recentExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * How many task rows the widget may show, derived from the terminal height.
+ * Mirrors Claude Code's `maxDisplay` exactly (TaskListV2.tsx:48):
+ *   rows <= 10 ? 0 : min(10, max(3, rows - 14))
+ * `process.stdout.rows` is a standard Node property that pi's TUI keeps up to
+ * date; it is undefined when stdout is not a TTY (e.g. piped), which we treat
+ * as the "show nothing but the summary" branch — a safe fallback.
+ */
+function getMaxDisplay(): number {
+	const rows = process.stdout.rows;
+	if (!rows || rows <= 10) return 0;
+	return Math.min(10, Math.max(3, rows - 14));
+}
+
+/**
+ * Clear the pending recent-expiry re-render timer (idempotent).
+ */
+function clearRecentExpiryTimer(): void {
+	if (recentExpiryTimer !== null) {
+		clearTimeout(recentExpiryTimer);
+		recentExpiryTimer = null;
+	}
+}
 
 // ---------------------------------------------------------------------------
 // taskListId resolution — matches Claude Code's `getTaskListId()` semantics.
@@ -463,6 +516,7 @@ function deleteTask(id: string): void {
 	if (!Number.isNaN(n)) {
 		highWaterMark = Math.max(highWaterMark, n); // never reuse deleted IDs
 	}
+	completionTimes.delete(id);
 }
 
 // ---------------------------------------------------------------------------
@@ -690,33 +744,73 @@ function refreshUI(ctx?: ExtensionContext): void {
 			);
 			const byIdAsc = (a: Task, b: Task) =>
 				Number(a.id) - Number(b.id) || a.id.localeCompare(b.id);
+			const isBlocked = (t: Task) => t.blockedBy.some((id) => unresolved.has(id));
 
-			const inProgress = visible.filter((t) => t.status === "in_progress").sort(byIdAsc);
-			const pending = visible.filter((t) => t.status === "pending").sort(byIdAsc);
-			const completed = visible.filter((t) => t.status === "completed").sort(byIdAsc);
+			// Display row cap: terminal-height-derived (Claude Code's
+			// `maxDisplay`), never exceeding pi's hard widget budget so the
+			// `… (widget truncated)` marker never appears.
+			const maxDisplay = Math.min(getMaxDisplay(), TASK_LINES_BUDGET);
+			const needsTruncation = visible.length > maxDisplay;
 
-			// Put live work on top, completed (struck-through) below. When the
-			// list would overflow the widget, keep every in_progress + pending
-			// line and only the most recent completed tasks, folding the older
-			// completed ones into a single `… +N completed` footer — this is what
-			// makes completed tasks "roll off" and keeps the view following
-			// progress (pi has no separate widget scroll primitive).
-			const alwaysShown = [...inProgress, ...pending];
-			const remaining = Math.max(0, TASK_LINES_BUDGET - alwaysShown.length);
-			const collapse = completed.length > remaining;
-			// The footer takes one line, so the completed rows we show shrink by one.
-			const completedShownCount = collapse ? Math.max(0, remaining - 1) : remaining;
-			// Most-recent completed first (id-descending).
-			const completedShown = [...completed].reverse().slice(0, completedShownCount);
-			const hiddenCompleted = completed.length - completedShown.length;
+			let visibleTasks: Task[];
+			let hiddenTasks: Task[];
+			if (!needsTruncation) {
+				// No re-ordering when the list fits — stable ID order (Claude
+				// Code TaskListV2.tsx:165-168).
+				visibleTasks = [...visible].sort(byIdAsc);
+				hiddenTasks = [];
+			} else {
+				// Overflow — prioritize (TaskListV2.tsx:139-164):
+				//   1. recently completed (within RECENT_COMPLETED_TTL_MS), byIdAsc
+				//   2. in-progress, byIdAsc
+				//   3. pending (unblocked first, then byIdAsc)
+				//   4. older completed, byIdAsc
+				const now = Date.now();
+				const recentCompleted: Task[] = [];
+				const olderCompleted: Task[] = [];
+				for (const t of visible) {
+					if (t.status !== "completed") continue;
+					const ts = completionTimes.get(t.id);
+					if (ts !== undefined && now - ts < RECENT_COMPLETED_TTL_MS) {
+						recentCompleted.push(t);
+					} else {
+						olderCompleted.push(t);
+					}
+				}
+				recentCompleted.sort(byIdAsc);
+				olderCompleted.sort(byIdAsc);
+				const inProgress = visible.filter((t) => t.status === "in_progress").sort(byIdAsc);
+				const pending = visible
+					.filter((t) => t.status === "pending")
+					.sort((a, b) => {
+						const aBlocked = isBlocked(a);
+						const bBlocked = isBlocked(b);
+						if (aBlocked !== bBlocked) return aBlocked ? 1 : -1;
+						return byIdAsc(a, b);
+					});
+				const prioritized = [...recentCompleted, ...inProgress, ...pending, ...olderCompleted];
+				visibleTasks = prioritized.slice(0, maxDisplay);
+				hiddenTasks = prioritized.slice(maxDisplay);
+			}
 
-			const taskLines: string[] = [
-				...alwaysShown,
-				...completedShown,
-			].map((t) => renderWidgetTaskLine(theme, t, unresolved, maxSubject));
+			const taskLines = visibleTasks.map((t) =>
+				renderWidgetTaskLine(theme, t, unresolved, maxSubject),
+			);
 
-			if (collapse) {
-				taskLines.push(theme.fg("dim", `… +${hiddenCompleted} completed`));
+			// Per-status hidden-task summary (Claude Code TaskListV2.tsx:170-189).
+			// Only rendered when maxDisplay > 0, matching Claude Code's
+			// `maxDisplay > 0 && hiddenSummary` JSX guard.
+			if (maxDisplay > 0 && hiddenTasks.length > 0) {
+				const parts: string[] = [];
+				const hi = hiddenTasks.filter((t) => t.status === "in_progress").length;
+				const hp = hiddenTasks.filter((t) => t.status === "pending").length;
+				const hc = hiddenTasks.filter((t) => t.status === "completed").length;
+				if (hi > 0) parts.push(`${hi} in progress`);
+				if (hp > 0) parts.push(`${hp} pending`);
+				if (hc > 0) parts.push(`${hc} completed`);
+				if (parts.length > 0) {
+					taskLines.push(theme.fg("dim", ` … +${parts.join(", ")}`));
+				}
 			}
 
 			uiHost.ui.setWidget(
@@ -724,6 +818,27 @@ function refreshUI(ctx?: ExtensionContext): void {
 				[theme.fg("dim", header), ...taskLines],
 				{ placement: "aboveEditor" },
 			);
+
+			// Schedule a re-render when the next recent-completed task rolls off
+			// its RECENT_COMPLETED_TTL_MS, so a just-finished task visibly drops
+			// out of the truncated view without waiting for the next mutation.
+			// Mirrors Claude Code's useEffect (TaskListV2.tsx:68-85).
+			clearRecentExpiryTimer();
+			let earliestExpiry = Infinity;
+			const nowForTimer = Date.now();
+			for (const ts of completionTimes.values()) {
+				const expiry = ts + RECENT_COMPLETED_TTL_MS;
+				if (expiry > nowForTimer && expiry < earliestExpiry) earliestExpiry = expiry;
+			}
+			if (earliestExpiry !== Infinity) {
+				const delay = earliestExpiry - nowForTimer;
+				recentExpiryTimer = setTimeout(() => {
+					recentExpiryTimer = null;
+					refreshUI();
+				}, delay);
+				// Don't hold the event loop open in a headless run (mirrors CC .unref()).
+				(recentExpiryTimer as unknown as { unref?: () => void }).unref?.();
+			}
 		}
 	} catch (err) {
 		console.warn("[picc-tasks] refreshUI: setWidget failed:", err);
@@ -1223,6 +1338,14 @@ Set up task dependencies:
 				statusChange = { from: task.status, to: params.status };
 				task.status = params.status;
 				updatedFields.push("status");
+				// Recency window: record the moment a task becomes completed;
+				// forget it when the task leaves completed (or on delete, handled
+				// in deleteTask). Mirrors Claude Code's completionTimestampsRef.
+				if (params.status === "completed") {
+					completionTimes.set(task.id, Date.now());
+				} else {
+					completionTimes.delete(task.id);
+				}
 			}
 
 			// --- Dependency edges (append-only with dedupe + mirror inverse) ---
@@ -1379,6 +1502,9 @@ export default function (pi: ExtensionAPI) {
 		stateFile = null;
 		taskListId = null;
 		lastCtx = null;
+		// Recency state resets on shutdown so a new session starts fresh.
+		completionTimes.clear();
+		clearRecentExpiryTimer();
 		// Turn counters reset on shutdown so a new session starts fresh.
 		currentTurnIndex = -1;
 		lastTaskToolTurnIndex = -1;
