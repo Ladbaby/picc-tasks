@@ -118,10 +118,19 @@ const TASK_LINES_BUDGET = WIDGET_MAX_LINES - 1;
  * (used by the `/tasks` command) still uses.
  */
 const WIDGET_ICONS: Record<TaskStatus, string> = {
-	pending: "☐",
+	pending: "▫",
 	in_progress: "▪",
 	completed: "✓",
 };
+
+/**
+ * Claude Code's completed-task checkmark is the fixed green `#2c7a3d`. pi's
+ * theme `success` color resolves to an olive green (`#b5bd68` in the dark
+ * theme), so we emit the exact brand green via a truecolor escape to match the
+ * reference appearance regardless of the active theme.
+ */
+const COMPLETED_CHECK_GREEN = "\x1b[38;2;44;122;61m";
+const ANSI_RESET = "\x1b[0m";
 
 // ---------------------------------------------------------------------------
 // Local truncation helper
@@ -579,9 +588,9 @@ function renderTaskListLine(t: Task): string {
  * Styled, Claude Code TaskListV2-style line for the above-editor widget.
  *
  * Per-status styling (mirrors TaskListV2's `getTaskIcon` + row flags):
- *   - completed   → green ✓, subject struck-through + dim
+ *   - completed   → green ✓ (`#2c7a3d`), subject struck-through + dim
  *   - in_progress → accent-colored ▪ (the Claude Code `claude` brand color), subject bold
- *   - pending     → dim ☐, subject plain (dim when blocked)
+ *   - pending     → dim ▫, subject plain (dim when blocked)
  * A task with unresolved blockers appends a dim ` › blocked by #…` suffix.
  * Only this widget path emits ANSI; the LLM-facing and `/tasks` outputs stay
  * plain (see `renderTaskListLine` / `renderTaskListLineForLLM`).
@@ -601,7 +610,7 @@ function renderWidgetTaskLine(
 	const subject = truncateSubject(t.subject, maxSubject);
 	switch (t.status) {
 		case "completed":
-			return `${theme.fg("success", icon)} ${theme.fg("muted", theme.strikethrough(subject))}`;
+			return `${COMPLETED_CHECK_GREEN}${icon}${ANSI_RESET} ${theme.fg("muted", theme.strikethrough(subject))}`;
 		case "in_progress":
 			return `${theme.fg("accent", icon)} ${theme.bold(subject)}${blockedSuffix}`;
 		default: // pending
