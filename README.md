@@ -86,11 +86,10 @@ One line per visible task:
 
 | Env var | Default | Effect |
 |---------|---------|--------|
-| `PI_TASK_LIST_ID` | (unset) | Explicit task-list id. Highest priority in task-list resolution. |
-| `CLAUDE_CODE_TASK_LIST_ID` | (unset) | Claude Code parity override. Used when `PI_TASK_LIST_ID` is unset. |
-| `PI_TASKS_VERIFICATION_NUDGE` | (unset) | When set to `1`/`true`/`yes`/`on`, enables the "spawn the verification agent" nudge. Off by default — mirrors Claude Code's default where the nudge is gated behind a build feature flag and a GrowthBook experiment, both off for end users. |
+| `PICC_TASKS_LIST_ID` | (unset) | Explicit task-list id. Highest priority in task-list resolution. |
+| `CLAUDE_CODE_TASK_LIST_ID` | (unset) | Claude Code parity override. Used when `PICC_TASKS_LIST_ID` is unset. |
 
-Task-list id resolution mirrors Claude Code's `getTaskListId()`: `PI_TASK_LIST_ID` → `CLAUDE_CODE_TASK_LIST_ID` → the session ID (per-session isolation by default).
+Task-list id resolution mirrors Claude Code's `getTaskListId()`: `PICC_TASKS_LIST_ID` → `CLAUDE_CODE_TASK_LIST_ID` → the session ID (per-session isolation by default).
 
 ## Storage (Claude Code parity)
 
@@ -113,7 +112,7 @@ Both the widget and pill are refreshed on every mutation and on session events; 
 
 Two Claude Code behaviors are mirrored (off by default where Claude Code gates them):
 
-- **Verification nudge** — when the last task in a 3+ task list is marked `completed` and no task subject matches `/verif/i`, the "spawn the verification agent (`subagent_type="verification"`)" NOTE is appended to the `TaskUpdate` result. Gated behind `PI_TASKS_VERIFICATION_NUDGE` (see above).
+- **Verification nudge** — when the last task in a 3+ task list is marked `completed` and no task subject matches `/verif/i`, the "spawn the verification agent (`subagent_type="verification"`)" NOTE is appended to the `TaskUpdate` result. Off by default and pinned off (`VERIFICATION_NUDGE_ENABLED`) — mirrors Claude Code's default where the nudge is gated behind a build feature flag and a GrowthBook experiment, both off for end users.
 - **`task_reminder`** — every 10 turns since the last `TaskCreate`/`TaskUpdate` (and at least 10 turns since the prior reminder), a gentle "the task tools haven't been used recently" message is injected, mirroring Claude Code's `task_reminder` attachment (`utils/attachments.ts`). It deliberately omits the task list to avoid stale statuses, telling the model to call `TaskList` for current state. `TaskStop` is not counted against this cadence — it is owned by picc-bash.
 
 ## Differences from Claude Code
