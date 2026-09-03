@@ -12,7 +12,7 @@
  * Storage (aligned with Claude Code's `getTaskListId` model in
  * claude-code/utils/tasks.ts):
  *   - In-memory `tasks: Task[]` + `highWaterMark` (closure-captured).
- *   - taskListId = PI_TASK_LIST_ID ?? CLAUDE_CODE_TASK_LIST_ID ??
+ *   - taskListId = PICC_TASKS_LIST_ID ?? CLAUDE_CODE_TASK_LIST_ID ??
  *     sessionManager.getSessionId(); default is per-session isolation.
  *   - On every mutating tool call, append a custom session entry
  *     `picc-tasks-state` containing the full snapshot — replayed on
@@ -35,7 +35,7 @@
  *     tool result. OFF BY DEFAULT — mirrors Claude Code's default where the
  *     nudge is gated behind `feature('VERIFICATION_AGENT')` and the
  *     `tengu_hive_evidence` GrowthBook experiment, both off for end users.
- *     Opt in by setting `PI_TASKS_VERIFICATION_NUDGE=1` (or true/yes/on).
+ *     There is no opt-in knob; the nudge is pinned off (VERIFICATION_NUDGE_ENABLED).
  *   - task_reminder: every 10 turns since the last TaskCreate / TaskUpdate
  *     call (and at least 10 turns since the prior reminder), a gentle
  *     reminder to use the task tools is injected as a follow-up message,
@@ -61,21 +61,19 @@ const WIDGET_KEY = "picc-tasks";
 const TASKS_FILE_NAME = "tasks.json";
 
 /** Env-var overrides for the task list ID (matches Claude Code's `getTaskListId`). */
-const ENV_TASK_LIST_ID_PI = "PI_TASK_LIST_ID";
+const ENV_TASK_LIST_ID_PICC = "PICC_TASKS_LIST_ID";
 const ENV_TASK_LIST_ID_CC = "CLAUDE_CODE_TASK_LIST_ID";
 
 /**
- * Opt-in gate for the verification nudge.
+ * Whether the "spawn the verification agent" nudge is enabled.
  *
- * Matches Claude Code's default behavior: the nudge is gated behind
- * `feature('VERIFICATION_AGENT')` AND the `tengu_hive_evidence` GrowthBook
- * experiment — both of which are off by default for end users, so the nudge
- * effectively never fires unless Anthropic rolls the experiment to your
- * account. On pi we have neither infrastructure, so we mirror the default by
- * leaving the nudge off and letting users opt in via env var. Set to `1`,
- * `true`, or `yes` to enable.
+ * Fixed at its default value of `false`, mirroring Claude Code's default where
+ * the nudge is gated behind `feature('VERIFICATION_AGENT')` AND the
+ * `tengu_hive_evidence` GrowthBook experiment — both of which are off for end
+ * users, so the nudge effectively never fires. pi has neither piece of
+ * infrastructure, so we pin the same default (off) with no opt-in knob.
  */
-const ENV_VERIFICATION_NUDGE = "PI_TASKS_VERIFICATION_NUDGE";
+const VERIFICATION_NUDGE_ENABLED = false;
 
 /** Mirrors Claude Code's `TODO_REMINDER_CONFIG` (utils/attachments.ts). */
 const TODO_REMINDER_CONFIG = {
@@ -248,14 +246,14 @@ function clearRecentExpiryTimer(): void {
 // ---------------------------------------------------------------------------
 // taskListId resolution — matches Claude Code's `getTaskListId()` semantics.
 // Priority:
-//   1. PI_TASK_LIST_ID env var (pi-specific, highest priority)
+//   1. PICC_TASKS_LIST_ID env var (picc-specific, highest priority)
 //   2. CLAUDE_CODE_TASK_LIST_ID env var (Claude Code parity)
 //   3. sessionManager.getSessionId() (default: per-session isolation)
 // ---------------------------------------------------------------------------
 
 function resolveTaskListId(ctx: ExtensionContext): string {
-	const piOverride = process.env[ENV_TASK_LIST_ID_PI]?.trim();
-	if (piOverride) return piOverride;
+	const piccOverride = process.env[ENV_TASK_LIST_ID_PICC]?.trim();
+	if (piccOverride) return piccOverride;
 	const ccOverride = process.env[ENV_TASK_LIST_ID_CC]?.trim();
 	if (ccOverride) return ccOverride;
 	return ctx.sessionManager.getSessionId();
@@ -524,15 +522,14 @@ function deleteTask(id: string): void {
 // (tools/TaskUpdateTool/TaskUpdateTool.ts:263-294, 397):
 //   - Trigger: allDone AND >=3 tasks AND none contains /verif/i.
 //   - Delivery: appended to the tool result text, not a separate follow-up.
-//   - Gated by PI_TASKS_VERIFICATION_NUDGE (off by default — mirrors Claude
-//     Code's default behavior where the nudge is gated behind the
-//     `VERIFICATION_AGENT` build flag and the `tengu_hive_evidence`
+//   - Gated by VERIFICATION_NUDGE_ENABLED (pinned to its default `false` —
+//     mirrors Claude Code's default behavior where the nudge is gated behind
+//     the `VERIFICATION_AGENT` build flag and the `tengu_hive_evidence`
 //     GrowthBook experiment, both off for end users).
 // ---------------------------------------------------------------------------
 
 function isVerificationNudgeEnabled(): boolean {
-	const v = process.env[ENV_VERIFICATION_NUDGE]?.trim().toLowerCase();
-	return v === "1" || v === "true" || v === "yes" || v === "on";
+	return VERIFICATION_NUDGE_ENABLED;
 }
 
 function computeVerificationNudgeNeeded(): boolean {
@@ -1379,7 +1376,7 @@ Set up task dependencies:
 			// --- Verification nudge check (mirrors Claude Code's TaskUpdateTool) ---
 			// NOTE: Claude Code additionally gates the nudge on `updates.status === 'completed'`
 			// (it fires only when *this* call completed a task). We fire whenever all tasks
-			// are done; this is moot because the nudge is off by default (see ENV_VERIFICATION_NUDGE).
+			// are done; this is moot because the nudge is off by default (see VERIFICATION_NUDGE_ENABLED).
 			// The nudge is appended to the tool result text, not sent as a separate follow-up.
 			const verificationNudgeNeeded = computeVerificationNudgeNeeded();
 			markTaskToolUsed();
