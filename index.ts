@@ -11,7 +11,19 @@
  *
  * Storage (aligned with Claude Code's `getTaskListId` model in
  * claude-code/utils/tasks.ts):
- *   - In-memory `tasks: Task[]` + `highWaterMark` (closure-captured).
+ *   - ALL mutable state — `tasks`, `highWaterMark`, the state file, the
+ *     taskListId, the auto-hide/recency timers, completion timestamps, and
+ *     the turn-reminder counters — is scoped PER SESSION (per resolved
+ *     taskListId) in a module-level `Map`. This mirrors Claude Code, where
+ *     `getTaskListId()` is resolved on every operation and each session's
+ *     tasks live in a distinct directory; there is no shared mutable list.
+ *   - Why per-session and NOT a single global: subagents (picc-subagents) run
+ *     IN-PROCESS and load this extension as the SAME module instance the
+ *     parent uses. If the task list were one global, a child's `session_start`
+ *     re-sync would overwrite the parent's in-memory list — and its auto-clear
+ *     timer could even wipe the parent's tasks (see the "subagent overwrites
+ *     the main agent's task list" bug). Keying by session id means the child
+ *     (a distinct `getSessionId()`) can only ever touch its own list.
  *   - taskListId = PICC_TASKS_LIST_ID ?? CLAUDE_CODE_TASK_LIST_ID ??
  *     sessionManager.getSessionId(); default is per-session isolation.
  *   - On every mutating tool call, append a custom session entry
@@ -183,16 +195,45 @@ type TaskStateEntryData = { tasks: Task[]; highWaterMark: number };
 type PersistedFile = { tasks: Task[]; highWaterMark: number };
 
 // ---------------------------------------------------------------------------
-// Module-level state
+// Per-session state
+//
+// The extension factory runs once per session, but the module (and therefore
+// the state below) is shared across every session in the process — including
+// in-process subagents spawned by picc-subagents. To keep sessions isolated
+// the way Claude Code keeps them (each `getTaskListId()` maps to its own
+// storage), all mutable state lives in a `Map` keyed by the resolved
+// taskListId. The default key is the session id, so parent and child sessions
+// naturally get separate entries and can never clobber one another.
 // ---------------------------------------------------------------------------
 
-let tasks: Task[] = [];
-let highWaterMark = 0;
-let stateFile: string | null = null;
-let taskListId: string | null = null;
-let lastCtx: ExtensionContext | null = null;
-/** Pending auto-hide timer, armed when every visible task is complete. */
-let hideTimer: ReturnType<typeof setTimeout> | null = null;
+interface SessionState {
+	tasks: Task[];
+	highWaterMark: number;
+	stateFile: string;
+	taskListId: string;
+	/** The freshest live UI context we've seen for this session. */
+	uiCtx: ExtensionContext | null;
+	/** Pending auto-hide timer, armed when every visible task is complete. */
+	hideTimer: ReturnType<typeof setTimeout> | null;
+	/**
+	 * id -> epoch-ms when the task transitioned to `completed`. Drives the
+	 * RECENT_COMPLETED_TTL_MS recency window.
+	 */
+	completionTimes: Map<string, number>;
+	/** One-shot re-render timer to drop a recently-completed task from the widget. */
+	recentExpiryTimer: ReturnType<typeof setTimeout> | null;
+	/**
+	 * Turn-reminder counters (see TODO_REMINDER_CONFIG). We keep our OWN
+	 * monotonic turn counter rather than trusting `TurnStartEvent.turnIndex`,
+	 * which the runtime resets to 0 at the start of every agent run.
+	 */
+	currentTurnIndex: number;
+	lastTaskToolTurnIndex: number; // -1 = never called this session
+	lastReminderTurnIndex: number;
+}
+
+/** All session-scoped task state, keyed by resolved taskListId (default: session id). */
+const sessions = new Map<string, SessionState>();
 
 /**
  * How long a just-completed task stays pinned near the top of the widget.
@@ -201,23 +242,6 @@ let hideTimer: ReturnType<typeof setTimeout> | null = null;
  * freshly-finished task is still visible for a moment before it rolls off.
  */
 const RECENT_COMPLETED_TTL_MS = 30_000;
-
-/**
- * id -> epoch-ms when the task transitioned to `completed`. Drives the
- * RECENT_COMPLETED_TTL_MS recency window. Populated on the `→ completed`
- * transition in TaskUpdate and pruned on deletion / leaving completed.
- * (Claude Code derives the same by diffing the completed set each render; we
- * capture it at the transition point so no per-render scan is needed.)
- */
-const completionTimes: Map<string, number> = new Map();
-
-/**
- * One-shot re-render timer armed by refreshUI() to drop a recently-completed
- * task out of the truncated view the moment its TTL expires — without waiting
- * for the next mutation. Mirrors Claude Code's `useEffect` that schedules
- * `forceUpdate` to the earliest expiry (TaskListV2.tsx:68-85).
- */
-let recentExpiryTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
  * How many task rows the widget may show, derived from the terminal height.
@@ -231,16 +255,6 @@ function getMaxDisplay(): number {
 	const rows = process.stdout.rows;
 	if (!rows || rows <= 10) return 0;
 	return Math.min(10, Math.max(3, rows - 14));
-}
-
-/**
- * Clear the pending recent-expiry re-render timer (idempotent).
- */
-function clearRecentExpiryTimer(): void {
-	if (recentExpiryTimer !== null) {
-		clearTimeout(recentExpiryTimer);
-		recentExpiryTimer = null;
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +271,29 @@ function resolveTaskListId(ctx: ExtensionContext): string {
 	const ccOverride = process.env[ENV_TASK_LIST_ID_CC]?.trim();
 	if (ccOverride) return ccOverride;
 	return ctx.sessionManager.getSessionId();
+}
+
+/** Get (or lazily create) the per-session state for the session `ctx` belongs to. */
+function ensureState(ctx: ExtensionContext): SessionState {
+	const listId = resolveTaskListId(ctx);
+	let state = sessions.get(listId);
+	if (!state) {
+		state = {
+			tasks: [],
+			highWaterMark: 0,
+			stateFile: join(homedir(), ".pi", "tasks", listId, TASKS_FILE_NAME),
+			taskListId: listId,
+			uiCtx: null,
+			hideTimer: null,
+			completionTimes: new Map(),
+			recentExpiryTimer: null,
+			currentTurnIndex: -1,
+			lastTaskToolTurnIndex: -1,
+			lastReminderTurnIndex: -1,
+		};
+		sessions.set(listId, state);
+	}
+	return state;
 }
 
 // ---------------------------------------------------------------------------
@@ -286,8 +323,7 @@ function isValidTask(t: any): t is Task {
 	);
 }
 
-function loadFromDisk(): PersistedFile {
-	if (!stateFile) return { tasks: [], highWaterMark: 0 };
+function loadFromDisk(stateFile: string): PersistedFile {
 	if (!existsSync(stateFile)) return { tasks: [], highWaterMark: 0 };
 	try {
 		const raw = readFileSync(stateFile, "utf-8");
@@ -305,12 +341,11 @@ function loadFromDisk(): PersistedFile {
 	}
 }
 
-function persist(): void {
-	if (!stateFile) return;
+function persist(state: SessionState): void {
 	try {
-		atomicWriteJson(stateFile, {
-			tasks: tasks.map((t) => ({ ...t })),
-			highWaterMark,
+		atomicWriteJson(state.stateFile, {
+			tasks: state.tasks.map((t) => ({ ...t })),
+			highWaterMark: state.highWaterMark,
 		});
 	} catch (err) {
 		console.error("[picc-tasks] persist failed:", err);
@@ -322,18 +357,15 @@ function persist(): void {
 // ---------------------------------------------------------------------------
 
 function syncState(ctx: ExtensionContext): void {
-	// 1. Resolve taskListId (env override or session ID) and build the
-	//    session-scoped file path under ~/.pi/tasks/{taskListId}/.
-	taskListId = resolveTaskListId(ctx);
-	stateFile = join(homedir(), ".pi", "tasks", taskListId, TASKS_FILE_NAME);
-	lastCtx = ctx;
+	const state = ensureState(ctx);
+	state.uiCtx = ctx;
 
-	// 2. Replay from session branch (snapshot in custom entry).
-	//    getBranch() can throw during /reload if the session manager is
-	//    mid-init (e.g. leafId / byId not yet set), so we wrap defensively
-	//    and fall back to disk-only when unavailable. See:
-	//    session-manager.js:861 — "Cannot read properties of undefined
-	//    (reading 'leafId')" when this.byId is undefined.
+	// Replay from session branch (snapshot in custom entry).
+	// getBranch() can throw during /reload if the session manager is
+	// mid-init (e.g. leafId / byId not yet set), so we wrap defensively
+	// and fall back to disk-only when unavailable. See:
+	// session-manager.js:861 — "Cannot read properties of undefined
+	// (reading 'leafId')" when this.byId is undefined.
 	let fromBranch: TaskStateEntryData = { tasks: [], highWaterMark: 0 };
 	try {
 		const sm = ctx.sessionManager as {
@@ -360,7 +392,7 @@ function syncState(ctx: ExtensionContext): void {
 		fromBranch = { tasks: [], highWaterMark: 0 };
 	}
 
-	// 3. Three-way merge using highWaterMark as a monotonic version counter.
+	// Three-way merge using highWaterMark as a monotonic version counter.
 	//
 	//   - Both 0: start fresh.
 	//   - diskHwm > branchHwm: disk is newer than the branch. This happens
@@ -375,28 +407,28 @@ function syncState(ctx: ExtensionContext): void {
 	// every mutation the user/agent made during the session and showing
 	// tasks as in_progress in the "task tools haven't been used recently"
 	// reminder.
-	const fromDisk = loadFromDisk();
+	const fromDisk = loadFromDisk(state.stateFile);
 	const branchHwm = fromBranch.highWaterMark;
 	const diskHwm = fromDisk.highWaterMark;
 	if (branchHwm === 0 && diskHwm === 0) {
-		tasks = [];
-		highWaterMark = 0;
+		state.tasks = [];
+		state.highWaterMark = 0;
 	} else if (diskHwm > branchHwm) {
-		tasks = fromDisk.tasks;
-		highWaterMark = fromDisk.highWaterMark;
+		state.tasks = fromDisk.tasks;
+		state.highWaterMark = fromDisk.highWaterMark;
 	} else {
-		tasks = fromBranch.tasks;
-		highWaterMark = fromBranch.highWaterMark;
+		state.tasks = fromBranch.tasks;
+		state.highWaterMark = fromBranch.highWaterMark;
 	}
 
-	refreshUI(ctx);
+	refreshUI(state, ctx);
 }
 
-function commitChange(pi: ExtensionAPI, ctx?: ExtensionContext): void {
+function commitChange(pi: ExtensionAPI, state: SessionState, ctx?: ExtensionContext): void {
 	try {
 		pi.appendEntry<TaskStateEntryData>(TASK_STATE_ENTRY, {
-			tasks: tasks.map((t) => ({ ...t })),
-			highWaterMark,
+			tasks: state.tasks.map((t) => ({ ...t })),
+			highWaterMark: state.highWaterMark,
 		});
 	} catch (err) {
 		// A "stale extension ctx" error is expected after /new, /fork, /resume,
@@ -412,16 +444,16 @@ function commitChange(pi: ExtensionAPI, ctx?: ExtensionContext): void {
 			console.error("[picc-tasks] appendEntry failed:", err);
 		}
 	}
-	persist();
+	persist(state);
 	// Prefer the caller's fresh ctx (the runner that created it is live by
-	// construction). Fall back to the module-level lastCtx when no ctx was
-	// supplied — syncState() does this right after setting lastCtx.
-	refreshUI(ctx);
+	// construction). Fall back to the session's last-seen ctx.
+	if (ctx !== undefined) state.uiCtx = ctx;
+	refreshUI(state, ctx);
 	// Re-evaluate auto-hide after every mutation (create/update/delete), the
 	// same point where Claude Code's useTasksV2 #fetch re-arms/clears its timer.
 	// Pass the caller's fresh ctx so the timer's later resetTaskList can still
-	// reach a live UI host (lastCtx may be stale by then).
-	armHideTimer(pi, ctx);
+	// reach a live UI host (state.uiCtx may be stale by then).
+	armHideTimer(pi, state, ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -431,10 +463,17 @@ function commitChange(pi: ExtensionAPI, ctx?: ExtensionContext): void {
 // after HIDE_DELAY_MS; any new/incomplete task cancels the pending clear.
 // ---------------------------------------------------------------------------
 
-function clearHideTimer(): void {
-	if (hideTimer !== null) {
-		clearTimeout(hideTimer);
-		hideTimer = null;
+function clearHideTimer(state: SessionState): void {
+	if (state.hideTimer !== null) {
+		clearTimeout(state.hideTimer);
+		state.hideTimer = null;
+	}
+}
+
+function clearRecentExpiryTimer(state: SessionState): void {
+	if (state.recentExpiryTimer !== null) {
+		clearTimeout(state.recentExpiryTimer);
+		state.recentExpiryTimer = null;
 	}
 }
 
@@ -443,13 +482,13 @@ function clearHideTimer(): void {
  * is intentionally left monotonic so a fresh TaskCreate never reuses a cleared
  * id — the same role as Claude Code's persisted `.highwatermark`.
  */
-function resetTaskList(pi: ExtensionAPI, ctx?: ExtensionContext): void {
-	clearHideTimer();
-	tasks = [];
+function resetTaskList(pi: ExtensionAPI, state: SessionState, ctx?: ExtensionContext): void {
+	clearHideTimer(state);
+	state.tasks = [];
 	try {
 		pi.appendEntry<TaskStateEntryData>(TASK_STATE_ENTRY, {
 			tasks: [],
-			highWaterMark,
+			highWaterMark: state.highWaterMark,
 		});
 	} catch (err) {
 		// Same stale-ctx swallow as commitChange: a session replacement after the
@@ -459,10 +498,10 @@ function resetTaskList(pi: ExtensionAPI, ctx?: ExtensionContext): void {
 			console.error("[picc-tasks] resetTaskList appendEntry failed:", err);
 		}
 	}
-	persist();
+	persist(state);
 	// Use the ctx that armed the timer (freshest available) so the widget
-	// actually clears; lastCtx can be stale by the time the timer fires.
-	refreshUI(ctx);
+	// actually clears; state.uiCtx can be stale by the time the timer fires.
+	refreshUI(state, ctx ?? state.uiCtx ?? undefined);
 }
 
 /**
@@ -471,38 +510,38 @@ function resetTaskList(pi: ExtensionAPI, ctx?: ExtensionContext): void {
  * HIDE_DELAY_MS. Any new/incomplete task cancels the pending clear.
  *
  * The `ctx` (the tool's fresh per-call ctx) is captured so the timer can still
- * reach a live UI host when it fires; by then `lastCtx` may be stale.
+ * reach a live UI host when it fires; by then `state.uiCtx` may be stale.
  */
-function armHideTimer(pi: ExtensionAPI, ctx?: ExtensionContext): void {
-	clearHideTimer();
-	const visible = tasks.filter(isVisible);
+function armHideTimer(pi: ExtensionAPI, state: SessionState, ctx?: ExtensionContext): void {
+	clearHideTimer(state);
+	const visible = state.tasks.filter(isVisible);
 	const hasIncomplete = visible.some((t) => t.status !== "completed");
 	if (hasIncomplete || visible.length === 0) {
 		// Incomplete work in flight, or nothing to show — no auto-hide.
 		return;
 	}
 	// All visible tasks are complete: hide + clear after a grace period.
-	hideTimer = setTimeout(() => {
-		hideTimer = null;
+	state.hideTimer = setTimeout(() => {
+		state.hideTimer = null;
 		// Re-check (mirrors #onHideTimerFired): only clear if still all-complete.
 		// A new TaskCreate/TaskUpdate since arming already cleared the timer via
 		// armHideTimer, but guard anyway against races.
-		const cur = tasks.filter(isVisible);
+		const cur = state.tasks.filter(isVisible);
 		if (cur.length > 0 && cur.every((t) => t.status === "completed")) {
-			resetTaskList(pi, ctx);
+			resetTaskList(pi, state, ctx);
 		}
 	}, HIDE_DELAY_MS);
 	// Don't hold the event loop open in a headless run (mirrors CC .unref()).
-	(hideTimer as unknown as { unref?: () => void }).unref?.();
+	(state.hideTimer as unknown as { unref?: () => void }).unref?.();
 }
 
 // ---------------------------------------------------------------------------
 // deleteTask — full reference cleanup + high-water-mark bump
 // ---------------------------------------------------------------------------
 
-function deleteTask(id: string): void {
-	tasks = tasks.filter((t) => t.id !== id);
-	for (const t of tasks) {
+function deleteTask(state: SessionState, id: string): void {
+	state.tasks = state.tasks.filter((t) => t.id !== id);
+	for (const t of state.tasks) {
 		if (t.blocks.includes(id)) {
 			t.blocks = t.blocks.filter((x) => x !== id);
 		}
@@ -512,9 +551,9 @@ function deleteTask(id: string): void {
 	}
 	const n = parseInt(id, 10);
 	if (!Number.isNaN(n)) {
-		highWaterMark = Math.max(highWaterMark, n); // never reuse deleted IDs
+		state.highWaterMark = Math.max(state.highWaterMark, n); // never reuse deleted IDs
 	}
-	completionTimes.delete(id);
+	state.completionTimes.delete(id);
 }
 
 // ---------------------------------------------------------------------------
@@ -532,11 +571,11 @@ function isVerificationNudgeEnabled(): boolean {
 	return VERIFICATION_NUDGE_ENABLED;
 }
 
-function computeVerificationNudgeNeeded(): boolean {
+function computeVerificationNudgeNeeded(state: SessionState): boolean {
 	if (!isVerificationNudgeEnabled()) return false;
-	if (tasks.length < 3) return false;
-	if (!tasks.every((t) => t.status === "completed")) return false;
-	return !tasks.some((t) => /verif/i.test(t.subject));
+	if (state.tasks.length < 3) return false;
+	if (!state.tasks.every((t) => t.status === "completed")) return false;
+	return !state.tasks.some((t) => /verif/i.test(t.subject));
 }
 
 const VERIFICATION_NUDGE_TEXT =
@@ -551,34 +590,19 @@ const VERIFICATION_NUDGE_TEXT =
 // has been used and at least `TURNS_BETWEEN_REMINDERS` (10) turns have
 // passed since the last reminder. TaskStop is intentionally NOT counted —
 // it is owned by picc-bash, not this extension.
-// ---------------------------------------------------------------------------
-
-// We keep our OWN monotonic turn counter rather than trusting the runtime's
-// `TurnStartEvent.turnIndex`. The runtime resets `turnIndex` to 0 at the start
-// of every agent *run* (`agent_start` fires once per user prompt, and each
-// user prompt is its own run), so a normal conversation of short runs never
-// lets `turnIndex` climb past TURNS_SINCE_WRITE — the reminder would only fire
-// on unusually long single runs. Counting ourselves (increment per turn_start,
-// reset only on session shutdown) makes "N turns since last task tool" survive
-// across runs, matching Claude Code's session-level cadence.
 //
 // The reminder DECISION is made in `turn_end` (not `turn_start`), and only when
 // the turn that just finished actually ran tools. That mirrors Claude Code's
 // `needsFollowUp` gate (query.ts:1062): the reminder is evaluated in the
 // "between turns" path, which only runs when the prior turn had `tool_use`
-// blocks. A final turn with no tool calls (e.g. the agent answered and is
-// waiting on the user) must not trigger it, otherwise a spurious steer forces
-// an extra turn at the end of the conversation.
+// blocks. A final turn with no tool calls must not trigger it, otherwise a
+// spurious steer forces an extra turn at the end of the conversation.
 //
-// Note: the reminder is intentionally NOT gated on permission mode. Claude
-// Code's `getTaskReminderAttachments` / `getTodoReminderAttachments` have no
-// `permissionContext.mode` check, so the nag fires in plan/auto/etc. too.
-let currentTurnIndex = -1;
-let lastTaskToolTurnIndex = -1; // -1 = never called this session
-let lastReminderTurnIndex = -1;
+// Note: the reminder is intentionally NOT gated on permission mode.
+// ---------------------------------------------------------------------------
 
-function markTaskToolUsed(): void {
-	lastTaskToolTurnIndex = currentTurnIndex;
+function markTaskToolUsed(state: SessionState): void {
+	state.lastTaskToolTurnIndex = state.currentTurnIndex;
 }
 
 function buildTaskReminderText(): string {
@@ -598,14 +622,14 @@ function buildTaskReminderText(): string {
 	);
 }
 
-function sendTaskReminder(pi: ExtensionAPI, turnIndex: number): void {
+function sendTaskReminder(pi: ExtensionAPI, state: SessionState, turnIndex: number): void {
 	const text = buildTaskReminderText();
 	try {
 		pi.sendMessage(
 			{ customType: "picc-tasks-reminder", content: text, display: false },
 			{ deliverAs: "steer", triggerTurn: false },
 		);
-		lastReminderTurnIndex = turnIndex;
+		state.lastReminderTurnIndex = turnIndex;
 	} catch (err) {
 		// Same stale-ctx guard as `commitChange`: don't bubble it up.
 		const msg = err instanceof Error ? err.message : String(err);
@@ -613,25 +637,29 @@ function sendTaskReminder(pi: ExtensionAPI, turnIndex: number): void {
 			// Treat the attempt as the reminder — otherwise we'd retry
 			// on every subsequent turn until a successful send, since
 			// the runner stays stale until the next session_start.
-			lastReminderTurnIndex = turnIndex;
+			state.lastReminderTurnIndex = turnIndex;
 		} else {
 			console.error("[picc-tasks] task_reminder delivery failed:", err);
 		}
 	}
 }
 
-function maybeFireTaskReminder(pi: ExtensionAPI): void {
+function maybeFireTaskReminder(pi: ExtensionAPI, state: SessionState): void {
 	const turnsSinceLastTaskManagement =
-		lastTaskToolTurnIndex < 0 ? currentTurnIndex : currentTurnIndex - lastTaskToolTurnIndex;
+		state.lastTaskToolTurnIndex < 0
+			? state.currentTurnIndex
+			: state.currentTurnIndex - state.lastTaskToolTurnIndex;
 	const turnsSinceLastReminder =
-		lastReminderTurnIndex < 0 ? currentTurnIndex : currentTurnIndex - lastReminderTurnIndex;
+		state.lastReminderTurnIndex < 0
+			? state.currentTurnIndex
+			: state.currentTurnIndex - state.lastReminderTurnIndex;
 	if (
 		turnsSinceLastTaskManagement < TODO_REMINDER_CONFIG.TURNS_SINCE_WRITE ||
 		turnsSinceLastReminder < TODO_REMINDER_CONFIG.TURNS_BETWEEN_REMINDERS
 	) {
 		return;
 	}
-	sendTaskReminder(pi, currentTurnIndex);
+	sendTaskReminder(pi, state, state.currentTurnIndex);
 }
 
 // ---------------------------------------------------------------------------
@@ -642,11 +670,11 @@ function isVisible(t: Task): boolean {
 	return t.metadata?._internal !== true;
 }
 
-function renderTaskListLine(t: Task): string {
+function renderTaskListLine(state: SessionState, t: Task): string {
 	const parts: string[] = [`${TASK_ICONS[t.status]} #${t.id}`, `[${t.status}]`, t.subject];
 	if (t.owner) parts.push(`(${t.owner})`);
 	let line = parts.join(" ");
-	const unresolved = new Set(tasks.filter((x) => x.status !== "completed").map((x) => x.id));
+	const unresolved = new Set(state.tasks.filter((x) => x.status !== "completed").map((x) => x.id));
 	const live = t.blockedBy.filter((id) => unresolved.has(id));
 	if (live.length > 0) {
 		line += ` [blocked by ${live.map((id) => `#${id}`).join(", ")}]`;
@@ -690,35 +718,35 @@ function renderWidgetTaskLine(
 
 // refreshUI() is best-effort: any ctx-stale error must be swallowed so it
 // never propagates out of a tool's execute() as an is_error result. The
-// in-memory `tasks` array is what matters for correctness; the widget
+// in-memory `state.tasks` array is what matters for correctness; the widget
 // and status pill will be re-rendered correctly on the next
 // session_start via syncState().
 //
 // When `ctx` is supplied (from a tool execute() or event handler), it is the
 // freshest possible ctx — runner.assertActive() has not yet been called on it
 // during tool dispatch, so hasUI and ui.* will not throw. When ctx is omitted
-// (e.g. from syncState() right after assigning lastCtx), we fall back to
-// lastCtx, which can be stale across session replacements (/new, /fork,
-// /resume, /reload). Tools should always pass ctx to avoid that window.
-function refreshUI(ctx?: ExtensionContext): void {
-	// Resolve the UI host: prefer the caller-supplied ctx; fall back to
-	// lastCtx when no ctx was passed.
+// (e.g. from a timer callback), we fall back to `state.uiCtx`, which can be
+// stale across session replacements (/new, /fork, /resume, /reload). Tools
+// should always pass ctx to avoid that window.
+function refreshUI(state: SessionState, ctx?: ExtensionContext): void {
+	// Resolve the UI host: prefer the caller-supplied ctx; fall back to the
+	// session's last-seen ctx when no ctx was passed.
 	let uiHost: ExtensionContext | null = null;
 	if (ctx !== undefined) {
 		uiHost = ctx;
 	} else {
 		try {
-			if (lastCtx?.hasUI === true) {
-				uiHost = lastCtx;
+			if (state.uiCtx?.hasUI === true) {
+				uiHost = state.uiCtx;
 			}
 		} catch {
-			// lastCtx runner was invalidated. Stay silent here — the next
+			// state.uiCtx runner was invalidated. Stay silent here — the next
 			// session_start will re-sync via syncState().
 		}
 	}
 	if (!uiHost) return;
 
-	const visible = tasks.filter(isVisible);
+	const visible = state.tasks.filter(isVisible);
 
 	// Above-editor widget (Claude Code TaskListV2 look).
 	try {
@@ -737,7 +765,7 @@ function refreshUI(ctx?: ExtensionContext): void {
 			// ` › blocked by` suffix so truncated subjects still fit.
 			const maxSubject = 72;
 			const unresolved = new Set(
-				tasks.filter((x) => x.status !== "completed").map((x) => x.id),
+				state.tasks.filter((x) => x.status !== "completed").map((x) => x.id),
 			);
 			const byIdAsc = (a: Task, b: Task) =>
 				Number(a.id) - Number(b.id) || a.id.localeCompare(b.id);
@@ -767,7 +795,7 @@ function refreshUI(ctx?: ExtensionContext): void {
 				const olderCompleted: Task[] = [];
 				for (const t of visible) {
 					if (t.status !== "completed") continue;
-					const ts = completionTimes.get(t.id);
+					const ts = state.completionTimes.get(t.id);
 					if (ts !== undefined && now - ts < RECENT_COMPLETED_TTL_MS) {
 						recentCompleted.push(t);
 					} else {
@@ -820,21 +848,21 @@ function refreshUI(ctx?: ExtensionContext): void {
 			// its RECENT_COMPLETED_TTL_MS, so a just-finished task visibly drops
 			// out of the truncated view without waiting for the next mutation.
 			// Mirrors Claude Code's useEffect (TaskListV2.tsx:68-85).
-			clearRecentExpiryTimer();
+			clearRecentExpiryTimer(state);
 			let earliestExpiry = Infinity;
 			const nowForTimer = Date.now();
-			for (const ts of completionTimes.values()) {
+			for (const ts of state.completionTimes.values()) {
 				const expiry = ts + RECENT_COMPLETED_TTL_MS;
 				if (expiry > nowForTimer && expiry < earliestExpiry) earliestExpiry = expiry;
 			}
 			if (earliestExpiry !== Infinity) {
 				const delay = earliestExpiry - nowForTimer;
-				recentExpiryTimer = setTimeout(() => {
-					recentExpiryTimer = null;
-					refreshUI();
+				state.recentExpiryTimer = setTimeout(() => {
+					state.recentExpiryTimer = null;
+					refreshUI(state);
 				}, delay);
 				// Don't hold the event loop open in a headless run (mirrors CC .unref()).
-				(recentExpiryTimer as unknown as { unref?: () => void }).unref?.();
+				(state.recentExpiryTimer as unknown as { unref?: () => void }).unref?.();
 			}
 		}
 	} catch (err) {
@@ -937,9 +965,10 @@ All tasks are created with status \`pending\`.
 				description: "A brief title for the task",
 			}),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			highWaterMark += 1;
-			const id = String(highWaterMark);
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const state = ensureState(ctx);
+			state.highWaterMark += 1;
+			const id = String(state.highWaterMark);
 			const task: Task = {
 				id,
 				subject: params.subject,
@@ -950,9 +979,9 @@ All tasks are created with status \`pending\`.
 				...(params.activeForm !== undefined ? { activeForm: params.activeForm } : {}),
 				...(params.metadata !== undefined ? { metadata: params.metadata } : {}),
 			};
-			tasks.push(task);
-			commitChange(pi, _ctx);
-			markTaskToolUsed();
+			state.tasks.push(task);
+			commitChange(pi, state, ctx);
+			markTaskToolUsed(state);
 
 			return {
 				content: [
@@ -1016,8 +1045,9 @@ Returns full task details:
 		parameters: Type.Object({
 			taskId: Type.String({ description: 'The ID of the task to retrieve' }),
 		}),
-		async execute(_toolCallId, params) {
-			const task = tasks.find((t) => t.id === params.taskId);
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const state = ensureState(ctx);
+			const task = state.tasks.find((t) => t.id === params.taskId);
 			if (!task) {
 				return {
 					content: [{ type: "text", text: "Task not found" }],
@@ -1092,8 +1122,9 @@ Use TaskGet with a specific task ID to view full details including description a
 			"List all tasks in the task list.",
 		promptGuidelines: [],
 		parameters: Type.Object({}),
-		async execute() {
-			const visible = tasks.filter(isVisible);
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			const state = ensureState(ctx);
+			const visible = state.tasks.filter(isVisible);
 			if (visible.length === 0) {
 				return {
 					content: [{ type: "text", text: "No tasks found" }],
@@ -1101,7 +1132,7 @@ Use TaskGet with a specific task ID to view full details including description a
 				};
 			}
 			const unresolvedIds = new Set(
-				tasks.filter((t) => t.status !== "completed").map((t) => t.id),
+				state.tasks.filter((t) => t.status !== "completed").map((t) => t.id),
 			);
 			const list = visible.map((t) => ({
 				id: t.id,
@@ -1169,7 +1200,7 @@ function registerTaskUpdate(pi: ExtensionAPI): void {
 - **status**: The task status (see Status Workflow below)
 - **subject**: Change the task title (imperative form, e.g., "Run tests")
 - **description**: Change the task description
-- **activeForm**: Present continuous form shown in spinner when in_progress (e.g., "Running tests")
+- **activeForm**: Change the active form shown in the spinner
 - **owner**: Change the task owner (agent name)
 - **metadata**: Merge metadata keys into the task (set a key to null to delete it)
 - **addBlocks**: Mark tasks that cannot start until this one completes
@@ -1255,8 +1286,9 @@ Set up task dependencies:
             ),
 			taskId: Type.String({ description: "The ID of the task to update" }),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			const idx = tasks.findIndex((t) => t.id === params.taskId);
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const state = ensureState(ctx);
+			const idx = state.tasks.findIndex((t) => t.id === params.taskId);
 			if (idx === -1) {
 				return {
 					content: [{ type: "text", text: "Task not found" }],
@@ -1269,7 +1301,7 @@ Set up task dependencies:
 				};
 			}
 
-			const task = tasks[idx]!;
+			const task = state.tasks[idx]!;
 			const updatedFields: string[] = [];
 			let statusChange: { from: TaskStatus; to: TaskStatus | "deleted" } | undefined;
 
@@ -1317,9 +1349,9 @@ Set up task dependencies:
 				if (params.status === "deleted") {
 					statusChange = { from: task.status, to: "deleted" };
 					const id = task.id;
-					deleteTask(id);
-					commitChange(pi, _ctx);
-					markTaskToolUsed();
+					deleteTask(state, id);
+					commitChange(pi, state, ctx);
+					markTaskToolUsed(state);
 					// Claude Code's deletion path reports a clean `['deleted']`
 					// (it does not carry over other fields from this call).
 					return {
@@ -1339,20 +1371,20 @@ Set up task dependencies:
 				// forget it when the task leaves completed (or on delete, handled
 				// in deleteTask). Mirrors Claude Code's completionTimestampsRef.
 				if (params.status === "completed") {
-					completionTimes.set(task.id, Date.now());
+					state.completionTimes.set(task.id, Date.now());
 				} else {
-					completionTimes.delete(task.id);
+					state.completionTimes.delete(task.id);
 				}
 			}
 
 			// --- Dependency edges (append-only with dedupe + mirror inverse) ---
 			if (params.addBlocks && params.addBlocks.length > 0) {
-				const validTargets = new Set(tasks.map((t) => t.id));
+				const validTargets = new Set(state.tasks.map((t) => t.id));
 				const before = task.blocks.length;
 				for (const targetId of params.addBlocks) {
 					if (!validTargets.has(targetId)) continue;
 					if (!task.blocks.includes(targetId)) task.blocks.push(targetId);
-					const target = tasks.find((t) => t.id === targetId);
+					const target = state.tasks.find((t) => t.id === targetId);
 					if (target && !target.blockedBy.includes(task.id)) {
 						target.blockedBy.push(task.id);
 					}
@@ -1360,12 +1392,12 @@ Set up task dependencies:
 				if (task.blocks.length > before) updatedFields.push("blocks");
 			}
 			if (params.addBlockedBy && params.addBlockedBy.length > 0) {
-				const validTargets = new Set(tasks.map((t) => t.id));
+				const validTargets = new Set(state.tasks.map((t) => t.id));
 				const before = task.blockedBy.length;
 				for (const upstreamId of params.addBlockedBy) {
 					if (!validTargets.has(upstreamId)) continue;
 					if (!task.blockedBy.includes(upstreamId)) task.blockedBy.push(upstreamId);
-					const upstream = tasks.find((t) => t.id === upstreamId);
+					const upstream = state.tasks.find((t) => t.id === upstreamId);
 					if (upstream && !upstream.blocks.includes(task.id)) {
 						upstream.blocks.push(task.id);
 					}
@@ -1378,10 +1410,10 @@ Set up task dependencies:
 			// (it fires only when *this* call completed a task). We fire whenever all tasks
 			// are done; this is moot because the nudge is off by default (see VERIFICATION_NUDGE_ENABLED).
 			// The nudge is appended to the tool result text, not sent as a separate follow-up.
-			const verificationNudgeNeeded = computeVerificationNudgeNeeded();
-			markTaskToolUsed();
+			const verificationNudgeNeeded = computeVerificationNudgeNeeded(state);
+			markTaskToolUsed(state);
 
-			commitChange(pi, _ctx);
+			commitChange(pi, state, ctx);
 
 			const details: Record<string, unknown> = {
 				success: true,
@@ -1423,14 +1455,15 @@ function registerTasksCommand(pi: ExtensionAPI): void {
 			// throws on a stale ctx. The /tasks command is informational
 			// only; never let a stale ctx bubble out as a command error.
 			try {
-				if (tasks.length === 0) {
+				const state = ensureState(ctx);
+				if (state.tasks.length === 0) {
 					ctx.ui.notify("No tasks yet. Use TaskCreate to add one.", "info");
 					return;
 				}
 				const blocks: string[] = [];
-				for (const t of tasks) {
+				for (const t of state.tasks) {
 					const internal = t.metadata?._internal === true ? " [internal]" : "";
-					blocks.push(`${renderTaskListLine(t)}${internal}`);
+					blocks.push(`${renderTaskListLine(state, t)}${internal}`);
 					blocks.push(`    ${t.description}`);
 					if (t.activeForm) blocks.push(`    active: ${t.activeForm}`);
 				}
@@ -1469,11 +1502,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// task_reminder cadence — see TODO_REMINDER_CONFIG above.
-	// Increment our OWN monotonic counter each turn. We deliberately ignore
-	// `event.turnIndex` (see the note above `currentTurnIndex`): the runtime
-	// resets it to 0 every agent run, which would break the across-runs cadence.
-	pi.on("turn_start", async () => {
-		currentTurnIndex += 1;
+	// Increment the per-session monotonic counter each turn. We deliberately
+	// ignore `event.turnIndex` (see the note above the SessionState counters):
+	// the runtime resets it to 0 every agent run, which would break the
+	// across-runs cadence.
+	pi.on("turn_start", async (_event, ctx) => {
+		const state = ensureState(ctx);
+		state.currentTurnIndex += 1;
 	});
 
 	// Decide whether to fire the reminder at the END of each turn, and only
@@ -1484,27 +1519,26 @@ export default function (pi: ExtensionAPI) {
 	// call — the same "between turns" injection point Claude Code uses — and a
 	// tool turn is always followed by a next LLM call in pi's loop, so the
 	// queued steer is always consumed.
-	pi.on("turn_end", async (event) => {
+	pi.on("turn_end", async (event, ctx) => {
 		if (event.toolResults.length > 0) {
-			maybeFireTaskReminder(pi);
+			const state = ensureState(ctx);
+			maybeFireTaskReminder(pi, state);
 		}
 	});
 
-	pi.on("session_shutdown", () => {
-		// In-memory references are intentionally cleared. Durable state lives
-		// in the session branch (via appendEntry) and on disk
-		// (~/.pi/tasks/{taskListId}/tasks.json). We do NOT track `pi` here —
-		// it's captured per-call from each tool's closure, so a new session
-		// gets a fresh `pi` automatically.
-		stateFile = null;
-		taskListId = null;
-		lastCtx = null;
-		// Recency state resets on shutdown so a new session starts fresh.
-		completionTimes.clear();
-		clearRecentExpiryTimer();
-		// Turn counters reset on shutdown so a new session starts fresh.
-		currentTurnIndex = -1;
-		lastTaskToolTurnIndex = -1;
-		lastReminderTurnIndex = -1;
+	pi.on("session_shutdown", async (_event, ctx) => {
+		// Drop this session's in-memory state. Durable state lives in the
+		// session branch (via appendEntry) and on disk
+		// (~/.pi/tasks/{taskListId}/tasks.json). Each session is its own map
+		// entry keyed by its resolved taskListId, so disposing one session
+		// never touches another's (e.g. a subagent's shutdown can't clear the
+		// parent's list). Note: in-process subagents may not emit
+		// session_shutdown (picc-subagents tears them down quietly), in which
+		// case their small per-session entry is simply reclaimed when the
+		// process exits.
+		const state = ensureState(ctx);
+		clearHideTimer(state);
+		clearRecentExpiryTimer(state);
+		sessions.delete(state.taskListId);
 	});
 }
